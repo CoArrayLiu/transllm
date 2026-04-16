@@ -327,10 +327,10 @@ Our framework was trained and evaluated across five datasets covering traffic fo
 If you find our work useful for your research, please cite our paper:
 
 ```bibtex
-@article{leng2025transllm,
-  title={TransLLM: A Unified Multi-Task Foundation Framework for Urban Transportation via Learnable Prompting},
-  author={Leng, Jiaming and Bi, Yunying and Qin, Chuan and Yin, Bing and Zhang, Yanyong and Wang, Chao},
-  journal={arXiv preprint arXiv:2508.14782},
-  year={2025}
+@inproceedings{leng2026transllm,
+  title={TransLLM: A Unified Multi-Task Large Language Model for Urban Transportation via Learnable Prompting},
+  author={Leng, Jiaming and Bi, Yunying and Qin, Chuan and Huang, Zhenya and Yin, Bing and Ren, Haojie and Zhang, Yanyong and Wang, Chao},
+  booktitle={Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics},
+  year={2026}
 }
 ```

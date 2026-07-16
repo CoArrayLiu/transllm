@@ -1,4 +1,6 @@
 Action:
+配置数据集
+
 修改了包导入问题   和生成使用的prompt文件夹名称不一致 问题
 
 增加了修改数据集文件夹名称的脚本
@@ -11,6 +13,17 @@ Action:
 ./scripts/generate_prompt_data.sh
 ```
 
+下载LLM 配置config.json
+```
+python -m pip install modelscope
+
+modelscope download \
+  --model LLM-Research/Meta-Llama-3.1-8B-Instruct \
+  --local_dir checkpoints/llama3-8b \
+  --exclude 'original/*'
+
+cp  backup/config.json  checkpoints/llama3-8b/config.json
+```
 
 
 Q:

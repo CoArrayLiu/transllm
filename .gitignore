@@ -8,3 +8,5 @@ __pycache__/
 wandb/
 data/
 TransLLM*
+result_checkpoint/
+metric_calculation/

@@ -1,0 +1,10 @@
+checkpoints/
+media/
+docs/
+*.whl
+*__pyacache__/
+__pycache__/
+.vscode/
+wandb/
+data/
+TransLLM*

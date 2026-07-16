@@ -16,7 +16,11 @@ def get_dataloader(args, normalizer = 'std', tod=False, dow=False, weather=False
     mean = np.mean(data_x_nor) 
     std = np.std(data_x_nor)
 
-    x_tra,x_1d,x_1w, y_tra = Add_Window_Horizon(data, args.his, args.pre, single)
+    points_per_hour = 60 // args.interval
+    x_tra,x_1d,x_1w, y_tra = Add_Window_Horizon(
+        data, args.his, args.pre, single,
+        points_per_hour=points_per_hour,
+    )
    
     print('Train: ', x_tra.shape, y_tra.shape)
     return x_tra,x_1d,x_1w, y_tra, mean, std

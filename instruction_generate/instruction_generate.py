@@ -305,7 +305,7 @@ for i in range(train_len):
             
 
 # =============================== .json and .pkl Saved =============================== #
-folder_path = './data/prompt_data1'
+folder_path = './data/prompt_data'
 if not os.path.exists(folder_path):
     os.makedirs(folder_path)
     print(f"Folder '{folder_path}' was created.")

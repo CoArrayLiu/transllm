@@ -171,12 +171,12 @@ pip install -r requirements.txt
 TransLLM is trained based on following excellent existing models. Please follow the instructions to prepare the checkpoints.
 - **Base Models.** 
   Prepare the base model , which serves as the instruction-tuned foundation model in our implementation. We provide several recommended options in the table below. You could download it and put it at ./checkpoints. Additionally, you should download our specific `config.json` file and update the `config.json` file of the base model. The configuration file is available on [Google Drive](https://drive.google.com/file/d/1ngKdAZ0EKmIXJWVYe42KA6TW99XXN7SX/view?usp=drive_link).
+  
   | base model | huggingface address |
   | :--- | :--- |
   | Llama3  | [https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) |
   | Vicuna | [https://huggingface.co/lmsys/vicuna-7b-v1.5](https://huggingface.co/lmsys/vicuna-7b-v1.5) |
   | Qwen2  | [https://huggingface.co/Qwen/Qwen2-7B-Instruct](https://huggingface.co/Qwen/Qwen2-7B-Instruct) |
-      
   
 - **Spatio-temporal Encoder.** 
   We employ a spatio-temporal encoder with a “sandwich” architecture that integrates GAT and TCNs to model complex dependencies. The weights of [st_encoder](https://drive.google.com/drive/folders/111uSBU5P4ZdzCU5OiPSm7xNUfNIaxT3D?usp=drive_link) are pre-trained via multi-task learning across five datasets, enabling it to learn highly generalizable spatio-temporal representations. You could download it and put it at ./checkpoints.
@@ -319,7 +319,6 @@ Our framework was trained and evaluated across five datasets covering traffic fo
 </tr>
 </tbody>
 </table>
-
 <a id="citation"></a>
 
 ## 10 Citation

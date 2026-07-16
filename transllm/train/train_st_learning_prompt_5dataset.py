@@ -33,7 +33,7 @@ for i in range(torch.cuda.device_count()):
     print(f"Device {i}: {torch.cuda.get_device_name(i)}")
 import transformers
 from torch.utils.data import Dataset
-from TransLLM.transllm.train.stchat_trainer import STChatTrainer
+from transllm.train.stchat_trainer import STChatTrainer
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.preprocessing import StandardScaler
 from transllm import conversation as conversation_lib

@@ -1,7 +1,8 @@
 import numpy as np
 
 
-def Add_Window_Horizon(data, window=12, horizon=12, single=False):
+def Add_Window_Horizon(data, window=12, horizon=12, single=False,
+                       points_per_hour=12):
     '''
     :param data: shape [T, ...], one data point every 5 minutes  
     :param window: window size in data points (default 12 = 1 hour)  
@@ -11,8 +12,9 @@ def Add_Window_Horizon(data, window=12, horizon=12, single=False):
         X_current, X_1h, X_2h, X_1d, X_1w: [B, window, ...]  
         Y: [B, horizon, ...] or [B, 1, ...]  '''
 
-    points_per_hour = 12
-    offset_1h = 12 * 1      # 12
+    # The recent-history window is one hour for 5-minute datasets, but it is
+    # 12 hours for the hourly UrbanEV dataset.
+    offset_1h = window
     offset_1d = points_per_hour * 24     # 288
     offset_1w = points_per_hour * 24 * 7 # 2016
 

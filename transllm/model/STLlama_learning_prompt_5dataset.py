@@ -87,6 +87,24 @@ class STPretrainConfig:
             setattr(self, key, value)
 
 
+def load_st_tower_weights(st_tower, checkpoint_path):
+    """Load legacy ST checkpoints without requiring obsolete duplicate modules."""
+    if any(parameter.is_meta for parameter in st_tower.parameters()):
+        return
+    state_dict = torch.load(checkpoint_path, map_location="cpu")
+    incompatible = st_tower.load_state_dict(state_dict, strict=False)
+    if incompatible.missing_keys:
+        raise RuntimeError(
+            f"ST checkpoint {checkpoint_path} is missing required keys: "
+            f"{incompatible.missing_keys}"
+        )
+    if incompatible.unexpected_keys:
+        print(
+            f"Ignoring {len(incompatible.unexpected_keys)} legacy ST checkpoint "
+            "keys (obsolete fusion weights and duplicate temporal aliases)"
+        )
+
+
 def load_model_pretrained(model_name, pretrain_model_path):
     # load conig json
     print("************************", pretrain_model_path)
@@ -125,13 +143,7 @@ class STLlamaModel(LlamaModel):
             
                 self.st_tower = self.make_stmodel(args)
                 filename = self.config.pretrain_ST_model_path
-                state_dict = torch.load(filename, map_location="cpu")
-                missing_keys, unexpected_keys = self.st_tower.load_state_dict(state_dict, strict=False)
-
-                if missing_keys:
-                    print("Missing keys:", missing_keys)
-                if unexpected_keys:
-                    print("Unexpected keys:", unexpected_keys)
+                load_st_tower_weights(self.st_tower, filename)
         if hasattr(config, "use_st_proj"):
             self.st_projector = nn.Linear(self.config.st_hidden_size*2, config.hidden_size)
             self.st_projector_sh = nn.Linear(self.config.st_hidden_size*2*12, self.config.hidden_size)
@@ -150,10 +162,7 @@ class STLlamaModel(LlamaModel):
             st_tower = st_tower[0]
 
         st_tower = st_tower.to(dtype=torch.float32)
-        model_state_dict = st_tower.state_dict()
-        loaded_state_dict = torch.load(self.config.pretrain_ST_model_path)
-        for name, param in loaded_state_dict.items():
-            model_state_dict[name].copy_(param)
+        load_st_tower_weights(st_tower, self.config.pretrain_ST_model_path)
         return st_tower
 
     def get_st_tower(self):
@@ -172,10 +181,7 @@ class STLlamaModel(LlamaModel):
                 torch.backends.cudnn.enabled = False
 
                 st_tower = self.make_stmodel(args)
-                loaded_state_dict = torch.load(self.config.pretrain_ST_model_path)
-                model_state_dict = st_tower.state_dict()
-                for name, param in loaded_state_dict.items():
-                    model_state_dict[name].copy_(param)
+                load_st_tower_weights(st_tower, self.config.pretrain_ST_model_path)
                 st_tower.requires_grad_(False)
         else:
             st_tower = self.st_tower
@@ -874,6 +880,7 @@ class STLlamaForCausalLM(LlamaForCausalLM):
             se_matrix: Optional[torch.LongTensor] = None,
             se_matrix_waiting: Optional[torch.LongTensor] = None,
             nodes_feature: Optional[torch.LongTensor] = None,
+            data_type: Optional[int] = 0,
             patchlist: Optional[list] = None,
             neighbors: Optional[torch.Tensor] = None,
             real_prob: Optional[list] = None,
@@ -885,7 +892,6 @@ class STLlamaForCausalLM(LlamaForCausalLM):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         device = next(self.parameters()).device
-        data_type =0
         if sources is not None:
             batch_datasets = {item[0]["id"].split('_')[1] for item in sources}
             if len(batch_datasets) != 1:
@@ -899,26 +905,26 @@ class STLlamaForCausalLM(LlamaForCausalLM):
             input_ids_batch = []
             labels_batch = []
             self.batch_num+=1
-            if len(st_data_x) > 1:
-                st_data_x_copy = copy.deepcopy(st_data_x)
-                st_data_x_copy = torch.cat(st_data_x_copy, dim=0)
-                mean=mean[0]
-                std=std[0]
-                st_data_x1_tmp = st_data_x_copy * std + mean
-                if dataset=='SH':
-                    st_data_xd_copy = None
-                    st_data_xw_copy = None
-                    real_prob = torch.cat(real_prob, dim=0)
-                else:
-                    st_data_xd_copy = copy.deepcopy(st_data_xd)
-                    st_data_xw_copy = copy.deepcopy(st_data_xw)
-                    st_data_xd_copy = torch.cat(st_data_xd_copy, dim=0)
-                    st_data_xw_copy = torch.cat(st_data_xw_copy, dim=0)
-                    st_data_xd_copy = st_data_xd_copy * std + mean   
-                    st_data_xw_copy = st_data_xw_copy * std + mean 
+            def concatenate_batch(values):
+                if isinstance(values, (list, tuple)):
+                    if not values:
+                        raise ValueError("Received an empty batch")
+                    return torch.cat(list(values), dim=0)
+                return values
 
-            else:            
-                st_data_x_copy = copy.deepcopy(st_data_x)
+            st_data_x_copy = concatenate_batch(copy.deepcopy(st_data_x))
+            batch_mean = mean[0] if isinstance(mean, (list, tuple)) else mean
+            batch_std = std[0] if isinstance(std, (list, tuple)) else std
+            st_data_x1_tmp = st_data_x_copy * batch_std + batch_mean
+            if dataset == 'SH':
+                st_data_xd_copy = None
+                st_data_xw_copy = None
+                real_prob = concatenate_batch(real_prob)
+            else:
+                st_data_xd_copy = concatenate_batch(copy.deepcopy(st_data_xd))
+                st_data_xw_copy = concatenate_batch(copy.deepcopy(st_data_xw))
+                st_data_xd_copy = st_data_xd_copy * batch_std + batch_mean
+                st_data_xw_copy = st_data_xw_copy * batch_std + batch_mean
             _, node_embedding = self.model.st_tower(st_data_x_copy[..., :3],sp_matrix[0],se_matrix[0],data_type,nodes_feature[0])
             region_select_out = []
             st_data_xh_tmp = []
@@ -935,20 +941,38 @@ class STLlamaForCausalLM(LlamaForCausalLM):
                     st_data_xd_tmp.append(st_data_xd_copy[b, :, start:end, :])
                     st_data_xw_tmp.append(st_data_xw_copy[b, :, start:end, :])
 
-            region_select_out = torch.stack(region_select_out, dim=0).reshape(node_embedding.shape[0],-1).to(torch.bfloat16)
+            region_select_out = torch.stack(region_select_out, dim=0).reshape(
+                node_embedding.shape[0], -1
+            )
             patchlist=[]
             empty_counts = []
             if dataset =='SD':
-                routing_info_sd = self.prompt_router_sd.select_prompts(region_select_out, track_episode=self.training_stage == "router", deterministic=not self.training)
+                routing_info_sd = self.prompt_router_sd.select_prompts(
+                    region_select_out.to(next(self.prompt_router_sd.parameters()).dtype),
+                    track_episode=self.training_stage == "router",
+                    deterministic=not self.training,
+                )
                 self.current_dataset = 'SD'
             elif dataset =='SZ':
-                routing_info_sz = self.prompt_router_sz.select_prompts(region_select_out, track_episode=self.training_stage == "router", deterministic=not self.training)
+                routing_info_sz = self.prompt_router_sz.select_prompts(
+                    region_select_out.to(next(self.prompt_router_sz.parameters()).dtype),
+                    track_episode=self.training_stage == "router",
+                    deterministic=not self.training,
+                )
                 self.current_dataset = 'SZ'
             elif dataset =='pems08':
-                routing_info_pems08 = self.prompt_router_pems08.select_prompts(region_select_out, track_episode=self.training_stage == "router", deterministic=not self.training)
+                routing_info_pems08 = self.prompt_router_pems08.select_prompts(
+                    region_select_out.to(next(self.prompt_router_pems08.parameters()).dtype),
+                    track_episode=self.training_stage == "router",
+                    deterministic=not self.training,
+                )
                 self.current_dataset = 'pems08'
             elif dataset =='urbanev':
-                routing_info_urbanev = self.prompt_router_urbanev.select_prompts(region_select_out, track_episode=self.training_stage == "router", deterministic=not self.training)
+                routing_info_urbanev = self.prompt_router_urbanev.select_prompts(
+                    region_select_out.to(next(self.prompt_router_urbanev.parameters()).dtype),
+                    track_episode=self.training_stage == "router",
+                    deterministic=not self.training,
+                )
                 self.current_dataset = 'urbanev'
             for i in range(len(sources)):  
                 if dataset=='SD':         
@@ -985,7 +1009,9 @@ class STLlamaForCausalLM(LlamaForCausalLM):
                     cur_token_len = 12
                     output_token_len = 12
 
-                st_cfg = {'use_st_start_end': True}
+                st_cfg = {
+                    'use_st_start_end': getattr(self.config, 'use_st_start_end', True)
+                }
 
                 patchlist.append(cur_token_len)
                 sources[i] = preprocess_ST(
@@ -1111,35 +1137,52 @@ class STLlamaForCausalLM(LlamaForCausalLM):
         else:
             self.st_pre_res.append(hidden_states.clone())
 
-        logits = self.lm_head(hidden_states)
+        compute_language_loss = not (
+            self.training_stage == "router" and labels_batch is not None
+        )
+        logits = self.lm_head(hidden_states) if compute_language_loss else None
         loss = None
         if labels_batch is not None:
 
             # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels_batch[..., 1:].contiguous()
-            # Flatten the tokens
+            shift_labels = labels_batch[..., 1:].contiguous().view(-1)
             loss_fct = CrossEntropyLoss()
             rec_loss = scaler_mae_loss(scaler=None, mask_value=None)
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
+            if compute_language_loss:
+                shift_logits = logits[..., :-1, :].contiguous().view(
+                    -1, self.config.vocab_size
+                )
             # Enable model/pipeline parallelism
             label_stpre_list = []
             task_type_all_list = []
-            shift_labels = shift_labels.to(shift_logits.device)
+            shift_labels = shift_labels.to(hidden_states.device)
+            valid_label_count = shift_labels.ne(IGNORE_INDEX).sum()
+            if valid_label_count.item() == 0:
+                raise RuntimeError(
+                    f"No supervised assistant tokens in {dataset} batch; "
+                    "check tokenizer chat_template and model_max_length"
+                )
+            if compute_language_loss:
+                language_loss = loss_fct(shift_logits, shift_labels)
+                if not torch.isfinite(language_loss):
+                    raise FloatingPointError(
+                        f"Non-finite language loss for {dataset}: "
+                        f"{language_loss.item()}"
+                    )
+            else:
+                language_loss = hidden_states.new_zeros((), dtype=torch.float32)
             if dataset =='SD' or dataset == 'SZ' or dataset == 'pems08' or dataset == 'urbanev':
-                if len(st_data_y) > 1:
-                    st_data_y = torch.cat(st_data_y, dim=0)
+                if isinstance(st_data_y, (list, tuple)):
+                    st_data_y = torch.cat(list(st_data_y), dim=0)
 
-                    for i in range(batch_size):                    
-                        label_stpre_list.append(st_data_y[i:i+1, :, region_start[i]:region_end[i], :feature_nums])
-                        task_type_all_list.append(st_data_y[i:i+1, 0, region_start[i], -1])
-                    
-                    labels_stpre = torch.cat(label_stpre_list, dim=0).to(torch.bfloat16)
-                    
-                else:
-                    labels_stpre = st_data_y[0][0:1, :, region_start[0]:region_end[0], :feature_nums].transpose(1, 2).to(torch.bfloat16)
-                
+                for i in range(batch_size):
+                    label_stpre_list.append(
+                        st_data_y[i:i + 1, :, region_start[i]:region_end[i], :feature_nums]
+                    )
+                    task_type_all_list.append(
+                        st_data_y[i:i + 1, 0, region_start[i], -1]
+                    )
+                labels_stpre = torch.cat(label_stpre_list, dim=0).to(torch.bfloat16)
 
                 regress_idx_list = []
 
@@ -1156,7 +1199,11 @@ class STLlamaForCausalLM(LlamaForCausalLM):
                 if dataset == 'SZ' or dataset == 'urbanev' :
                     loss_regress_scaling_factor = 1.0
                     loss_regress = loss_regress*loss_regress_scaling_factor
-                loss = loss_fct(shift_logits, shift_labels) + loss_regress
+                if not torch.isfinite(loss_regress):
+                    raise FloatingPointError(
+                        f"Non-finite regression loss for {dataset}: {loss_regress.item()}"
+                    )
+                loss = language_loss + loss_regress
             elif dataset == 'SH':
                 # ==== RL：dispatch reward ====
                 real_prob_list=[]
@@ -1193,7 +1240,7 @@ class STLlamaForCausalLM(LlamaForCausalLM):
                 entropy = -(probs * probs.log()).sum(dim=1).mean()
                 loss1 = 0.5 -reward_sum.mean() - 0.008 * entropy
                 loss_per_sample = -reward_per_grid.mean(dim=1)
-                loss = loss_fct(shift_logits, shift_labels) + loss1*100 + wasserstein_distance.mean() *0.05
+                loss = language_loss + loss1*100 + wasserstein_distance.mean() *0.05
                 print(f"Reward mean: {reward_per_grid.mean().item():.4f}, Reward std: {reward_per_grid.std().item():.4f}, Advantage std: {advantage.std().item():.4f}, Reinforce Loss: {loss1.item():.6f}, Wasserstein: {wasserstein_distance.mean().item():.6f}", flush=True)
             else:
                 raise ValueError(f"Unsupported dataset for loss calculation: {dataset}")
@@ -1214,7 +1261,8 @@ class STLlamaForCausalLM(LlamaForCausalLM):
                 if router_loss is not None:
                     loss = loss + router_loss
 
-            print(loss_fct(shift_logits, shift_labels)) 
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"Non-finite total loss for {dataset}: {loss.item()}")
 
         if not return_dict:
             output = (logits,) + outputs[1:]

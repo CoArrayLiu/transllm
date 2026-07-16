@@ -31,6 +31,12 @@ cp  backup/config.json  checkpoints/llama3-8b/config.json
 
 修改了SH数据集相关代码
 
+### commit remove SH related code
+
+修复了训练推理的一些bug
+
+### commit fix some train-eval bugs
+
 
 Q:
 

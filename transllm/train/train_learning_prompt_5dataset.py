@@ -57,21 +57,29 @@ parser.add_argument("--st_data_path_urbanev", default=st_data_path_urbanev, type
 parser.add_argument("--st_tower", default="ST_Encoder", type=str)
 parser.add_argument("--tune_st_mlp_adapter", default=False, type=str2bool)
 parser.add_argument("--st_select_layer", default=-2, type=int)
-parser.add_argument("--use_st_start_end", action='store_true')
+parser.add_argument("--use_st_start_end", action=argparse.BooleanOptionalAction, default=True)
 parser.add_argument("--bf16", default=True, type=str2bool)
+parser.add_argument("--fp16", default=False, type=str2bool)
 parser.add_argument("--output_dir", default=output_model, type=str)
 parser.add_argument("--num_train_epochs", default=1,type=int)
-parser.add_argument("--per_device_train_batch_size", default=8, type=int)
+parser.add_argument("--max_steps", default=-1, type=int)
+parser.add_argument("--per_device_train_batch_size", default=2, type=int)
 parser.add_argument("--num_prompts", default=4, type=int)
 parser.add_argument("--num_slots", default=4, type=int)
-parser.add_argument("--per_device_eval_batch_size", default=8, type=int)
-parser.add_argument("--gradient_accumulation_steps", default=1, type=int)
+parser.add_argument("--per_device_eval_batch_size", default=2, type=int)
+parser.add_argument("--gradient_accumulation_steps", default=4, type=int)
+parser.add_argument("--dataloader_num_workers", default=0, type=int)
+parser.add_argument("--dataloader_pin_memory", default=True, type=str2bool)
+parser.add_argument("--dataloader_persistent_workers", default=False, type=str2bool)
+parser.add_argument("--dataloader_prefetch_factor", default=None, type=int)
 parser.add_argument("--evaluation_strategy", default="no", type=str)
 parser.add_argument("--save_strategy", default="steps", type=str)
 parser.add_argument("--save_steps", default=4800, type=int)
 parser.add_argument("--save_total_limit", default=1, type=int)
+parser.add_argument("--skip_final_save", default=False, type=str2bool)
 parser.add_argument("--learning_rate", default=1e-4, type=float)
 parser.add_argument("--weight_decay", default=0.0, type=float)
+parser.add_argument("--max_grad_norm", default=1.0, type=float)
 parser.add_argument("--warmup_ratio", default=0.03, type=float)
 parser.add_argument("--lr_scheduler_type", default="cosine", type=str)
 parser.add_argument("--logging_steps", default=1, type=int)
@@ -80,7 +88,8 @@ parser.add_argument("--model_max_length", default=2048, type=int)
 parser.add_argument("--gradient_checkpointing", default=True, type=str2bool)
 parser.add_argument("--lazy_preprocess", default=True, type=str2bool)
 parser.add_argument("--report_to", default="wandb", type=str)
-parser.add_argument("--bits", default=8, type=int)
+parser.add_argument("--seed", default=42, type=int)
+parser.add_argument("--bits", default=16, type=int)
 parser.add_argument("--lora_enable", default=True, type=str2bool)
 parser.add_argument("--freeze_backbone", default=True, type=str2bool)
 parser.add_argument("--freeze_prompt_router", default=True, type=str2bool)
@@ -88,6 +97,28 @@ parser.add_argument("--training_stage", choices=("llm", "router"), default="llm"
 parser.add_argument("--resume_checkpoint", default=None, type=str)
 
 args = parser.parse_args()
+
+if args.bf16 and args.fp16:
+    parser.error("--bf16 and --fp16 cannot both be true")
+if args.per_device_train_batch_size <= 0:
+    parser.error("--per_device_train_batch_size must be positive")
+if args.gradient_accumulation_steps <= 0:
+    parser.error("--gradient_accumulation_steps must be positive")
+if args.dataloader_num_workers < 0:
+    parser.error("--dataloader_num_workers must be non-negative")
+if (
+    args.dataloader_prefetch_factor is not None
+    and args.dataloader_prefetch_factor <= 0
+):
+    parser.error("--dataloader_prefetch_factor must be positive")
+if args.bits not in (4, 8, 16):
+    parser.error("--bits must be one of 4, 8, or 16")
+if args.skip_final_save and args.max_steps <= 0:
+    parser.error("--skip_final_save is only allowed with a positive --max_steps")
+if args.dataloader_num_workers == 0 and args.dataloader_persistent_workers:
+    parser.error("--dataloader_persistent_workers requires dataloader_num_workers > 0")
+if args.dataloader_num_workers == 0 and args.dataloader_prefetch_factor is not None:
+    parser.error("--dataloader_prefetch_factor requires dataloader_num_workers > 0")
 
 # A stage name is the source of truth; this prevents contradictory boolean
 # combinations such as a router stage with LoRA still enabled.
@@ -125,18 +156,27 @@ model_args, data_args, training_args = hf_parser.parse_args_into_dataclasses(
         f"--tune_st_mlp_adapter={args.tune_st_mlp_adapter}",
         f"--st_select_layer={args.st_select_layer}",
         f"--bf16={args.bf16}",
+        f"--fp16={args.fp16}",
         f"--output_dir={args.output_dir}",
         f"--num_train_epochs={args.num_train_epochs}",
+        f"--max_steps={args.max_steps}",
         f"--per_device_train_batch_size={args.per_device_train_batch_size}",
         f"--per_device_eval_batch_size={args.per_device_eval_batch_size}",
         f"--num_prompts={args.num_prompts}",
         f"--num_slots={args.num_slots}",
         f"--gradient_accumulation_steps={args.gradient_accumulation_steps}",
+        f"--dataloader_num_workers={args.dataloader_num_workers}",
+        f"--dataloader_pin_memory={args.dataloader_pin_memory}",
+        f"--dataloader_persistent_workers={args.dataloader_persistent_workers}",
+        *( [f"--dataloader_prefetch_factor={args.dataloader_prefetch_factor}"]
+           if args.dataloader_prefetch_factor is not None else [] ),
         f"--save_strategy={args.save_strategy}",
         f"--save_steps={args.save_steps}",
         f"--save_total_limit={args.save_total_limit}",
+        f"--skip_final_save={args.skip_final_save}",
         f"--learning_rate={args.learning_rate}",
         f"--weight_decay={args.weight_decay}",
+        f"--max_grad_norm={args.max_grad_norm}",
         f"--warmup_ratio={args.warmup_ratio}",
         f"--lr_scheduler_type={args.lr_scheduler_type}",
         f"--logging_steps={args.logging_steps}",
@@ -145,13 +185,14 @@ model_args, data_args, training_args = hf_parser.parse_args_into_dataclasses(
         f"--gradient_checkpointing={args.gradient_checkpointing}",
         f"--lazy_preprocess={args.lazy_preprocess}",
         f"--report_to={args.report_to}",
+        f"--seed={args.seed}",
         f"--bits={args.bits}",
         f"--lora_enable={args.lora_enable}",
         f"--freeze_backbone={args.freeze_backbone}",
         f"--freeze_prompt_router={args.freeze_prompt_router}",
         f"--training_stage={args.training_stage}",
         *( [f"--resume_checkpoint={args.resume_checkpoint}"] if args.resume_checkpoint else [] ),
-        *( ["--use_st_start_end"] if args.use_st_start_end else [] ),
+        f"--use_st_start_end={args.use_st_start_end}",
     ]
 )
 

@@ -1,6 +1,6 @@
 import argparse
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import torch.nn  as nn
@@ -74,7 +74,11 @@ def load_prompting_file(file_path):
 
 
 def run_eval(args, num_gpus):
-    # split question file into num_gpus files
+    if num_gpus != 1:
+        raise ValueError(
+            "This evaluator runs one process on one GPU; launch separate processes "
+            "with disjoint start_id/end_id ranges for multi-GPU evaluation"
+        )
     prompt_file = load_prompting_file(args.prompting_file)
     print('prompt_file_len', len(prompt_file))
     prompt_file = prompt_file[args.start_id:args.end_id]
@@ -239,7 +243,7 @@ def eval_model(args, prompt_file, start_idx, end_idx):
 
     model = STLlamaForCausalLM.from_pretrained(args.model_name, num_prompts=4, num_slots=4,torch_dtype=torch.bfloat16, use_cache=True,device_map=None,
                                                   low_cpu_mem_usage=False).to("cuda")
-    model.set_st_tower()
+    model.get_st_tower().to(device="cuda", dtype=torch.float32)
     model.eval()
     print('finish loading')
     args1 = get_config()
@@ -247,9 +251,26 @@ def eval_model(args, prompt_file, start_idx, end_idx):
     graphs = load_adj(args1)
    
     use_st_start_end = getattr(model.config, "use_st_start_end", True)
-    tokenizer.add_tokens([DEFAULT_ST_PATCH_TOKEN], special_tokens=True)
-    if use_st_start_end:
-        tokenizer.add_tokens([DEFAULT_ST_START_TOKEN, DEFAULT_ST_END_TOKEN], special_tokens=True)
+    if not use_st_start_end:
+        raise ValueError("The four-dataset checkpoint must use ST start/end tokens")
+    required_tokens = [
+        DEFAULT_ST_PATCH_TOKEN,
+        DEFAULT_ST_START_TOKEN,
+        DEFAULT_ST_END_TOKEN,
+    ]
+    required_ids = tokenizer.convert_tokens_to_ids(required_tokens)
+    embedding_count = model.get_input_embeddings().num_embeddings
+    invalid_tokens = [
+        token
+        for token, token_id in zip(required_tokens, required_ids)
+        if token_id is None
+        or token_id == tokenizer.unk_token_id
+        or token_id >= embedding_count
+    ]
+    if invalid_tokens:
+        raise ValueError(
+            f"Checkpoint tokenizer/model is missing required ST tokens: {invalid_tokens}"
+        )
 
     st_tower = model.get_model().st_tower
 
@@ -269,10 +290,8 @@ def eval_model(args, prompt_file, start_idx, end_idx):
     error_i = 0
     temp = 0
     output_file = osp.join(args.output_res_path, f'arxiv_test_res_{start_idx}_{end_idx}.json')
-    with open(output_file, "w") as fout:
-        fout.write("[\n")
 
-    for idx, instruct_item in tqdm(enumerate(prompt_file)):
+    for idx, instruct_item in tqdm(enumerate(prompt_file), total=len(prompt_file)):
         st_dict = load_st(idx, instruct_item, st_data_all)
         st_token_len = st_dict['st_token_len']
         st_data_x = st_dict['st_data_x']
@@ -346,31 +365,16 @@ def eval_model(args, prompt_file, start_idx, end_idx):
         qs = qs.replace(DEFAULT_STHIS_TOKEN, replace_token)
         qs = qs.replace(DEFAULT_STPRE_TOKEN, replace_token1)
 
-        conv_mode = "stchat_llama"
-
-        if args.conv_mode is not None and conv_mode != args.conv_mode:
-            print('[WARNING] the auto inferred conversation mode is {}, while `--conv-mode` is {}, using {}'.format(
-                conv_mode, args.conv_mode, args.conv_mode))
-        else:
-            args.conv_mode = conv_mode
-
-        conv = conv_templates[args.conv_mode].copy()
-        formatted_conversation = conv.system
-        formatted_conversation += f"<｜User｜>{qs}<｜Assistant｜>"
-        conv.messages.append(formatted_conversation)
-
-        prompt = formatted_conversation
-
-        inputs = tokenizer([prompt])
-        
-
-        input_ids = torch.as_tensor(inputs.input_ids).cuda()
-
-        stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
-
-        keywords = [stop_str]
-        stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
-
+        llama3_conversation = conv_templates["llama3_v2_1"]
+        input_ids = tokenizer.apply_chat_template(
+            [
+                {"role": "system", "content": llama3_conversation.system},
+                {"role": "user", "content": qs},
+            ],
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+        ).cuda()
         attention_mask = (input_ids != tokenizer.pad_token_id).long()
 
 
@@ -384,17 +388,16 @@ def eval_model(args, prompt_file, start_idx, end_idx):
                 do_sample=False,
                 attention_mask = attention_mask,
                 pad_token_id=tokenizer.pad_token_id,
-                max_new_tokens=256,
+                max_new_tokens=args.max_new_tokens,
                 nodes_feature = node_feature,
                 sp_matrix = sp_matrix,
                 se_matrix = se_matrix,
                 data_type = graph["st_encoder_type"],
                 patchlist=patchlist,
-                mean = [mean],
-                std = [std],
+                mean = mean.item(),
+                std = std.item(),
                 st_data_xd = st_data_xd,
-                st_data_xw = st_data_xw,
-                stopping_criteria=[stopping_criteria])
+                st_data_xw = st_data_xw)
 
             # Find the special tokens
             start_inx = torch.where(output_ids[0, :] == st_config.st_start_token)[0]
@@ -439,20 +442,25 @@ def eval_model(args, prompt_file, start_idx, end_idx):
                 if n_diff_input_output > 0:
                     print(f'[Warning] {n_diff_input_output} output_ids are not the same as the input_ids')
  
-                outputs = tokenizer.batch_decode(output_ids[:, input_token_len:], skip_special_tokens=False)[0]
-                outputs = outputs.strip()
-                if outputs.endswith(stop_str):
-                    outputs = outputs[:-len(stop_str)]
-                outputs = outputs.strip()
                 res_data.append(
-                        {"id": instruct_item["id"],  "x_in": x_in, "y_in": y_in,
-                            "st_pre_infolow": st_pre_infolow}.copy())
-                with open(osp.join(args.output_res_path, 'arxiv_test_res_{}_{}.json'.format(start_idx, end_idx)), "w") as fout:
-                    json.dump(res_data, fout, indent=4)
+                    {
+                        "id": instruct_item["id"],
+                        "x_in": x_in,
+                        "y_in": y_in,
+                        "st_pre_infolow": st_pre_infolow,
+                    }
+                )
             else:
                 print('========error========')
                 error_i = error_i + 1
                 print(error_i)
+
+    with open(output_file, "w") as fout:
+        json.dump(res_data, fout, indent=2)
+    if not res_data:
+        raise RuntimeError(
+            "Evaluation produced no valid predictions; inspect ST token positions"
+        )
     return
 
 
@@ -471,9 +479,9 @@ if __name__ == "__main__":
     parser.add_argument("--prompting_file", type=str, default=datapath)
     parser.add_argument("--conv-mode", type=str, default=None)
     parser.add_argument("--st_data_path", type=str, default=st_data_path)
-    parser.add_argument("--use_st_start_end", type=bool, default=True)
     parser.add_argument("--output_res_path", type=str, default=res_path)
     parser.add_argument("--num_gpus", type=int, default=num_gpus)
+    parser.add_argument("--max_new_tokens", type=int, default=256)
 
     parser.add_argument("--start_id", type=int, default=start_id)
     parser.add_argument("--end_id", type=int, default=end_id)

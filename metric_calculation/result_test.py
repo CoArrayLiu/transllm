@@ -1,5 +1,8 @@
 import torch
-from metrics import All_Metrics
+try:
+    from .metrics import All_Metrics
+except ImportError:
+    from metrics import All_Metrics
 import json
 import numpy as np
 import os

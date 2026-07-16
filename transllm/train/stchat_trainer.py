@@ -22,15 +22,24 @@ def unwrap_model(model: nn.Module) -> nn.Module:
 from torch.utils.data import DataLoader
 class STChatTrainer(Trainer):
     def get_train_dataloader(self):
-        return DataLoader(
-            self.train_dataset,
+        dataloader_kwargs = dict(
+            dataset=self.train_dataset,
             batch_size=self.args.train_batch_size,
-            shuffle=False,  
+            shuffle=False,
             collate_fn=self.data_collator,
             drop_last=self.args.dataloader_drop_last,
             num_workers=self.args.dataloader_num_workers,
             pin_memory=self.args.dataloader_pin_memory,
         )
+        if self.args.dataloader_num_workers > 0:
+            dataloader_kwargs["persistent_workers"] = (
+                self.args.dataloader_persistent_workers
+            )
+            if self.args.dataloader_prefetch_factor is not None:
+                dataloader_kwargs["prefetch_factor"] = (
+                    self.args.dataloader_prefetch_factor
+                )
+        return DataLoader(**dataloader_kwargs)
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, 'tune_st_mlp_adapter', False):
             _state_dict = state_dict
@@ -62,4 +71,31 @@ class STChatTrainer(Trainer):
             # sys.stdout = open(os.devnull, 'w')
 
         super(STChatTrainer, self)._save(output_dir, state_dict)
+
+        # PEFT checkpoints contain adapters but omit the other trainable modules
+        # (prediction heads, projector, lm_head, or routers). Save them beside
+        # every Trainer checkpoint so resume is mathematically complete.
+        output_dir = output_dir or self.args.output_dir
+        model_to_save = unwrap_model(self.model)
+        trainable_names = {
+            name
+            for name, parameter in model_to_save.named_parameters()
+            if parameter.requires_grad and "lora_" not in name
+        }
+        complete_state = state_dict if state_dict is not None else model_to_save.state_dict()
+        non_lora_state = {
+            name: complete_state[name].detach().cpu()
+            for name in trainable_names
+            if name in complete_state
+        }
+        missing = sorted(trainable_names.difference(non_lora_state))
+        if missing:
+            raise RuntimeError(
+                f"Could not save all trainable non-LoRA parameters: {missing}"
+            )
+        os.makedirs(output_dir, exist_ok=True)
+        torch.save(
+            non_lora_state,
+            os.path.join(output_dir, "non_lora_trainables.bin"),
+        )
 

@@ -46,13 +46,26 @@ class TemporalConvNet(nn.Module):
             in_channels = num_inputs if i == 0 else num_channels[i-1]
             out_channels = num_channels[i]
             padding = (kernel_size - 1) * dilation_size
-            self.conv = nn.Conv2d(in_channels, out_channels, (1, kernel_size), dilation=(1, dilation_size), padding=(0, padding))
-            self.conv.weight.data.normal_(0, 0.01)
-            self.chomp = Chomp1d(padding)
-            self.relu = nn.ReLU()
-            self.dropout = nn.Dropout(dropout)
-
-            layers += [nn.Sequential(self.conv, self.chomp, self.relu, self.dropout)]
+            # Keep these modules registered only through ``self.network``.
+            # Registering the final loop iteration both as ``self.conv`` and as
+            # ``network.*`` created shared state-dict tensors that safetensors
+            # correctly refused to save.
+            conv = nn.Conv2d(
+                in_channels,
+                out_channels,
+                (1, kernel_size),
+                dilation=(1, dilation_size),
+                padding=(0, padding),
+            )
+            conv.weight.data.normal_(0, 0.01)
+            layers.append(
+                nn.Sequential(
+                    conv,
+                    Chomp1d(padding),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                )
+            )
 
         self.network = nn.Sequential(*layers)
         self.downsample = nn.Conv2d(num_inputs, num_channels[-1], (1, 1)) if num_inputs != num_channels[-1] else None

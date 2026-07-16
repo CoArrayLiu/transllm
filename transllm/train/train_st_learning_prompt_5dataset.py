@@ -21,6 +21,7 @@ import json
 import logging
 import pathlib
 import argparse
+import copy
 import pickle
 from typing import Dict, Optional, Sequence, List
 import pandas as pd
@@ -62,7 +63,7 @@ class ModelArguments:
     st_tower: Optional[str] = field(default=None)
     st_select_layer: Optional[int] = field(default=-1)  # default to the last layer
     pretrain_st_mlp_adapter: Optional[str] = field(default=None)
-    use_st_start_end: bool = field(default=False)
+    use_st_start_end: bool = field(default=True)
     num_prompts: int = 0
     num_slots: int = 0
 
@@ -124,6 +125,7 @@ class TrainingArguments(transformers.TrainingArguments):
     disable_tqdm: bool = False
     training_stage: str = "llm"
     resume_checkpoint: Optional[str] = None
+    skip_final_save: bool = False
 
 def get_dataset_info(dataset):
     base_dir = os.getcwd() + '/data/'
@@ -285,18 +287,24 @@ def get_peft_state_non_lora_maybe_zero_3(named_params, require_grad_only=True):
 
 
 def find_all_linear_names(model):
-    cls = torch.nn.Linear
-    lora_module_names = set()
-    for name, module in model.named_modules():
-        if isinstance(module, cls):
-            names = name.split('.')
-            module_name = names[0] if len(names) == 1 else names[-1]
-            name1 = names[1] if len(names) != 1 else names[-1]
-            if 'st_pred_linear' not in module_name and 'st_projector' not in module_name and not name.startswith('prompt_router') and 'st_tower' not in name1:
-                lora_module_names.add(name)
-    if 'lm_head' in lora_module_names:  # needed for 16-bit
-        lora_module_names.remove('lm_head')
-    return list(lora_module_names)
+    """Return only Llama-backbone linear layers for LoRA injection."""
+    excluded = (
+        "lm_head",
+        "st_tower",
+        "st_projector",
+        "st_pred_linear",
+        "prompt_router",
+        "value_head",
+    )
+    lora_module_names = {
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, torch.nn.Linear)
+        and not any(component in name for component in excluded)
+    }
+    if not lora_module_names:
+        raise RuntimeError("No Llama linear modules were found for LoRA")
+    return sorted(lora_module_names)
 
 
 def configure_trainable_parameters(model, training_stage):
@@ -430,6 +438,7 @@ class LazySupervisedDataset_ST(Dataset):
                  tokenizer: transformers.PreTrainedTokenizer,
                  st_cfg: dict,
                  batch_size: int = 16,
+                 seed: int = 42,
                  **kwargs):
         super(LazySupervisedDataset_ST, self).__init__()
         logging.warning("Loading data...")
@@ -448,20 +457,22 @@ class LazySupervisedDataset_ST(Dataset):
         args.bs = batch_size
         self.graphs = load_adj(args)
         self.batch_size = batch_size
+        self.seed = seed
 
         self.build_index_sequence()
 
     def build_index_sequence(self):
     # """Construct index sequences by batch, where each batch of 16 samples comes from the same dataset"""
         import random
+        rng = random.Random(self.seed)
         sd_indices = list(range(len(self.sd_list_data_dict)))
         pems08_indices = list(range(len(self.pems08_list_data_dict)))
         sz_indices = list(range(len(self.sz_list_data_dict)))
         urbanev_indices = list(range(len(self.urbanev_list_data_dict)))
-        random.shuffle(sd_indices)
-        random.shuffle(pems08_indices)
-        random.shuffle(sz_indices)
-        random.shuffle(urbanev_indices)
+        rng.shuffle(sd_indices)
+        rng.shuffle(pems08_indices)
+        rng.shuffle(sz_indices)
+        rng.shuffle(urbanev_indices)
 
         def split_batches(indices):
             return [indices[i:i+self.batch_size]
@@ -537,6 +548,10 @@ class LazySupervisedDataset_ST(Dataset):
             region_start = int(sources["id"].split('_')[4])
             region_end = int(sources["id"].split('_')[5])
             i4data_all = int(sources["id"].split('_')[7])
+        # The model rewrites the prompt for the selected router action. Never
+        # expose the JSON object stored by the Dataset, otherwise epoch 1
+        # corrupts the source prompt used by later epochs and resume runs.
+        sources = copy.deepcopy(sources)
         data_dict = dict()
         data_dict['st_data_x'] = torch.tensor(st_data_all[i4data_all]['data_x'], dtype=torch.float32)
         data_dict['st_data_y'] = torch.tensor(st_data_all[i4data_all]['data_y'], dtype=torch.float32)
@@ -600,7 +615,7 @@ class DataCollatorForSupervisedDataset(object):
 
 
 def make_supervised_stdata_module(tokenizer: transformers.PreTrainedTokenizer,
-                                  data_args,batch_size) -> Dict:
+                                  data_args, batch_size, seed) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
     print('lazy_preprocess', data_args.lazy_preprocess)
     dataset_cls = (LazySupervisedDataset_ST
@@ -617,7 +632,8 @@ def make_supervised_stdata_module(tokenizer: transformers.PreTrainedTokenizer,
                                     st_content=data_args.st_content,
                                     use_st_start_end=getattr(data_args, 'use_st_start_end', False)
                                 ),
-                                batch_size= batch_size,
+                                batch_size=batch_size,
+                                seed=seed,
                                 st_data_path_sd=data_args.st_data_path_sd,
                                 st_data_path_sz=data_args.st_data_path_sz,
                                 st_data_path_pems08=data_args.st_data_path_pems08,
@@ -638,12 +654,57 @@ def train(model_args, data_args, training_args):
         raise ValueError("The llm stage requires --lora_enable=True")
     if training_args.training_stage == "router" and training_args.lora_enable:
         raise ValueError("The router stage requires --lora_enable=False")
+    if training_args.training_stage == "router" and training_args.gradient_checkpointing:
+        print(
+            "Disabling gradient checkpointing for router stage because the "
+            "Llama/ST backbone is frozen"
+        )
+        training_args.gradient_checkpointing = False
+    if training_args.world_size != 1:
+        raise ValueError(
+            "The current four-dataset batch scheduler pre-batches graph edges and "
+            "supports one GPU process only; multi-process launch would duplicate data"
+        )
     if model_args.st_tower != "ST_Encoder":
         raise ValueError("Four-dataset training requires the pretrained ST_Encoder tower")
+    if (
+        training_args.max_steps == 1
+        and training_args.get_warmup_steps(training_args.max_steps) > 0
+    ):
+        raise ValueError(
+            "A one-step run with warmup performs its only optimizer step at zero "
+            "learning rate; use --warmup_ratio 0 for a one-step smoke test"
+        )
+    if not model_args.use_st_start_end:
+        raise ValueError(
+            "Four-dataset training requires --use_st_start_end so ST spans can be located"
+        )
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
-    print('compute_dtype', compute_dtype)
+    effective_batch_size = (
+        training_args.per_device_train_batch_size
+        * training_args.gradient_accumulation_steps
+        * max(1, training_args.world_size)
+    )
+    print(
+        "training_resource_config:",
+        {
+            "per_device_batch_size": training_args.per_device_train_batch_size,
+            "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
+            "world_size": training_args.world_size,
+            "effective_global_batch_size": effective_batch_size,
+            "model_max_length": training_args.model_max_length,
+            "gradient_checkpointing": training_args.gradient_checkpointing,
+            "bits": training_args.bits,
+            "compute_dtype": str(compute_dtype),
+            "dataloader_num_workers": training_args.dataloader_num_workers,
+            "dataloader_prefetch_factor": training_args.dataloader_prefetch_factor,
+            "dataloader_persistent_workers": training_args.dataloader_persistent_workers,
+        },
+    )
 
     bnb_model_from_pretrained_args = {}
+    if training_args.bits == 16:
+        bnb_model_from_pretrained_args["torch_dtype"] = compute_dtype
     if training_args.bits in [4, 8]:
         from transformers import BitsAndBytesConfig
         bnb_model_from_pretrained_args.update(dict(
@@ -653,6 +714,31 @@ def train(model_args, data_args, training_args):
                 load_in_8bit=training_args.bits == 8,
                 llm_int8_threshold=6.0,
                 llm_int8_has_fp16_weight=False,
+                llm_int8_skip_modules=[
+                    "lm_head",
+                    "model.st_tower",
+                    "model.st_projector",
+                    "model.st_projector_sh",
+                    "prompt_router_sd",
+                    "prompt_router_sz",
+                    "prompt_router_pems08",
+                    "prompt_router_urbanev",
+                    "prompt_router_sh",
+                    "st_pred_linear_1",
+                    "st_pred_linear_2",
+                    "st_pred_linear_3",
+                    "st_pred_linear_4",
+                    "st_pred_linear_5",
+                    "st_pred_linear_6",
+                    "st_pred_linear_7",
+                    "st_pred_linear_8",
+                    "st_pred_linear_9",
+                    "st_pred_linear_10",
+                    "st_pred_linear_11",
+                    "st_pred_linear_12",
+                    "st_pred_linear_dispatch",
+                    "value_head",
+                ],
                 bnb_4bit_compute_dtype=compute_dtype,
                 bnb_4bit_use_double_quant=training_args.double_quant,
                 bnb_4bit_quant_type=training_args.quant_type,
@@ -698,13 +784,17 @@ def train(model_args, data_args, training_args):
             })
     elif model_args.version == "v2":
         conversation_lib.default_conversation = conversation_lib.conv_templates["llama3_v2_1"]
-        tokenizer.pad_token = None
-        if tokenizer.pad_token is None:
+        llama3_pad_token = "<|finetune_right_pad_id|>"
+        llama3_pad_id = tokenizer.convert_tokens_to_ids(llama3_pad_token)
+        if llama3_pad_id is None or llama3_pad_id == tokenizer.unk_token_id:
             smart_tokenizer_and_embedding_resize(
                 special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),
                 tokenizer=tokenizer,
                 model=model,
             )
+        else:
+            tokenizer.pad_token = llama3_pad_token
+            model.config.pad_token_id = llama3_pad_id
     else:
         tokenizer.pad_token = tokenizer.unk_token #<unk>
         conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1_1"]
@@ -801,6 +891,14 @@ def train(model_args, data_args, training_args):
 
         training_args.freeze_prompt_router = training_args.training_stage != "router"
         configure_trainable_parameters(model, training_args.training_stage)
+        if training_args.training_stage == "router":
+            for router_name in (
+                "prompt_router_sd",
+                "prompt_router_pems08",
+                "prompt_router_sz",
+                "prompt_router_urbanev",
+            ):
+                getattr(model, router_name).to(dtype=torch.float32)
         
         params_no_grad = [n for n, p in model.named_parameters() if not p.requires_grad]
         
@@ -840,7 +938,12 @@ def train(model_args, data_args, training_args):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
 
-    data_module = make_supervised_stdata_module(tokenizer=tokenizer, data_args=data_args,batch_size=training_args.per_device_train_batch_size)
+    data_module = make_supervised_stdata_module(
+        tokenizer=tokenizer,
+        data_args=data_args,
+        batch_size=training_args.per_device_train_batch_size,
+        seed=training_args.seed,
+    )
 
     trainer = STChatTrainer(model=model,
                             tokenizer=tokenizer,
@@ -852,10 +955,70 @@ def train(model_args, data_args, training_args):
     for name, param in model.named_parameters():
         if param.requires_grad:
             tuned_params.append(name)
-    print(tuned_params)
+    print(
+        "trainable_parameter_tensors:",
+        len(tuned_params),
+        "examples:",
+        tuned_params[:8],
+    )
 
-    trainer.train(resume_from_checkpoint=training_args.resume_checkpoint)
+    if training_args.resume_checkpoint:
+        non_lora_path = os.path.join(
+            training_args.resume_checkpoint, "non_lora_trainables.bin"
+        )
+        if not os.path.isfile(non_lora_path):
+            raise FileNotFoundError(
+                f"Resume checkpoint is incomplete: {non_lora_path} is missing"
+            )
+        non_lora_state = torch.load(non_lora_path, map_location="cpu")
+        incompatible = model.load_state_dict(non_lora_state, strict=False)
+        unexpected = [
+            key for key in incompatible.unexpected_keys if "lora_" not in key
+        ]
+        if unexpected:
+            raise RuntimeError(
+                f"Unexpected non-LoRA checkpoint keys: {unexpected}"
+            )
+
+    original_torch_load = torch.load
+    if training_args.resume_checkpoint:
+        # Transformers 4.41 predates PyTorch 2.6's weights_only=True default
+        # and its RNG/optimizer checkpoint files contain trusted Python/NumPy
+        # state. Scope the compatibility behavior to this explicit local resume.
+        def resume_compatible_torch_load(*args, **kwargs):
+            kwargs.setdefault("weights_only", False)
+            return original_torch_load(*args, **kwargs)
+
+        torch.load = resume_compatible_torch_load
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    try:
+        train_result = trainer.train(
+            resume_from_checkpoint=training_args.resume_checkpoint
+        )
+    finally:
+        torch.load = original_torch_load
     trainer.save_state()
+    if torch.cuda.is_available():
+        print(
+            "training_gpu_stats:",
+            {
+                "peak_allocated_gib": round(
+                    torch.cuda.max_memory_allocated() / (1024 ** 3), 3
+                ),
+                "peak_reserved_gib": round(
+                    torch.cuda.max_memory_reserved() / (1024 ** 3), 3
+                ),
+                "train_steps_per_second": train_result.metrics.get(
+                    "train_steps_per_second"
+                ),
+                "train_runtime_seconds": train_result.metrics.get("train_runtime"),
+            },
+        )
+
+    if training_args.skip_final_save:
+        print("Skipping final model save for bounded smoke/benchmark run")
+        return
 
     if training_args.lora_enable:
         state_dict = get_peft_state_maybe_zero_3(
@@ -865,14 +1028,23 @@ def train(model_args, data_args, training_args):
             model.named_parameters()
         )
         if training_args.local_rank == 0 or training_args.local_rank == -1:
-            model = model.merge_and_unload()
-            model.save_pretrained(os.path.join(training_args.output_dir, 'full_model'))
+            os.makedirs(training_args.output_dir, exist_ok=True)
             model.save_pretrained(training_args.output_dir, state_dict=state_dict)
-            torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, 'non_lora_trainables.bin'))
+            tokenizer.save_pretrained(training_args.output_dir)
+            torch.save(
+                non_lora_state_dict,
+                os.path.join(training_args.output_dir, 'non_lora_trainables.bin'),
+            )
+            merged_model = model.merge_and_unload()
+            full_model_dir = os.path.join(training_args.output_dir, 'full_model')
+            merged_model.save_pretrained(full_model_dir)
+            tokenizer.save_pretrained(full_model_dir)
     else:
         safe_save_model_for_hf_trainer(trainer=trainer,
                                        output_dir=training_args.output_dir)
 
 
 if __name__ == "__main__":
-    train()
+    raise SystemExit(
+        "Use: python -m transllm.train.train_learning_prompt_5dataset"
+    )

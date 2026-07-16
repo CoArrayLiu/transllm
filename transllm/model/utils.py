@@ -240,76 +240,80 @@ def preprocess_llama3(
         sources: List[List[Dict]],
         tokenizer: transformers.PreTrainedTokenizer,
 ) -> Dict:
-    conv = conversation_lib.default_conversation.copy()
-    roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
-    conversations = []
-   
-    for i, source in enumerate(sources):
-        if roles[source[0]["from"]] != conv.roles[0]:
-            # Skip the first one if it is not from human
-            source = source[1:]
-        formatted_conversation = conv.system
-        conv.messages = []
-        for j, sentence in enumerate(source):
-            role = roles[sentence["from"]]
-            assert role == conv.roles[j % 2], f"{i}"
-            content = sentence["value"]
+    """Tokenize Llama 3 conversations and supervise assistant spans only."""
+    if tokenizer.chat_template is None:
+        raise ValueError("Llama 3 tokenizer is missing chat_template")
+    if tokenizer.pad_token_id is None:
+        raise ValueError("Tokenizer pad_token must be configured before preprocessing")
 
-            if role == roles["human"]:
-                formatted_conversation += f"<｜User｜>{content}"
-            elif role == roles["gpt"]:
-                formatted_conversation += f"<｜Assistant｜>{content}<｜end▁of▁sentence｜>"
-            else:
-                raise ValueError(f"Unknown role type: {role}")
+    max_length = tokenizer.model_max_length
+    encoded_samples = []
+    label_samples = []
+    system_prompt = conversation_lib.default_conversation.system
 
+    def encode(messages, add_generation_prompt=False):
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
+        )
 
-        conversations.append(formatted_conversation)
+    for sample_index, source in enumerate(sources):
+        messages = [{"role": "system", "content": system_prompt}]
+        for turn_index, sentence in enumerate(source):
+            role = {"human": "user", "gpt": "assistant"}.get(sentence["from"])
+            if role is None:
+                raise ValueError(f"Unknown role {sentence['from']!r} in sample {sample_index}")
+            expected = "user" if turn_index % 2 == 0 else "assistant"
+            if role != expected:
+                raise ValueError(
+                    f"Unexpected {role} turn at index {turn_index} in sample {sample_index}"
+                )
+            messages.append({"role": role, "content": sentence["value"]})
 
-    input_ids = tokenizer(
-        conversations,
-        return_tensors="pt",
-        padding="longest",
-        max_length=tokenizer.model_max_length,
-        truncation=True,
-    ).input_ids
-    targets = input_ids.clone()
+        full_ids = encode(messages)
+        if len(full_ids) > max_length:
+            raise ValueError(
+                f"Tokenized sample {sample_index} has {len(full_ids)} tokens, "
+                f"exceeding model_max_length={max_length}; increase "
+                "--model_max_length to avoid silently truncating supervision"
+            )
+        labels = torch.full((len(full_ids),), IGNORE_INDEX, dtype=torch.long)
 
-    for conversation, target in zip(conversations, targets):
-        total_len = int(target.ne(tokenizer.pad_token_id).sum()) 
-        cur_len = 1
-
-        target[:cur_len] = IGNORE_INDEX
-
-        while cur_len < total_len:
-            user_start = conversation.find("<｜User｜>", cur_len)
-            if user_start == -1:
-                break
-
-            assistant_start = conversation.find("<｜Assistant｜>", user_start)
-            if assistant_start == -1:
-                break
-
-            user_tokens = tokenizer(conversation[cur_len-1:cur_len-1+assistant_start]).input_ids
-            assistant_tokens = tokenizer(conversation[cur_len-1+assistant_start:]).input_ids
-
-            user_len = len(user_tokens) - 1
-            assistant_len = len(assistant_tokens) - 1
-
-            target[cur_len:cur_len + user_len + 1] = IGNORE_INDEX
-            cur_len += user_len + assistant_len 
-
-        target[cur_len:] = IGNORE_INDEX
-
-        if cur_len < tokenizer.model_max_length:
-            if cur_len != total_len:
-                target[:] = IGNORE_INDEX
-                print(
-                    f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}. (ignored)"
+        for message_index, message in enumerate(messages):
+            if message["role"] != "assistant":
+                continue
+            prefix_ids = encode(messages[:message_index], add_generation_prompt=True)
+            completed_ids = encode(messages[:message_index + 1])
+            if completed_ids != full_ids[:len(completed_ids)]:
+                raise ValueError(
+                    f"Llama 3 chat template produced an unstable prefix for sample {sample_index}"
+                )
+            start_index = min(len(prefix_ids), len(full_ids))
+            end_index = min(len(completed_ids), len(full_ids))
+            if end_index > start_index:
+                labels[start_index:end_index] = torch.tensor(
+                    full_ids[start_index:end_index], dtype=torch.long
                 )
 
+        if not labels.ne(IGNORE_INDEX).any():
+            raise ValueError(
+                f"No assistant tokens remain after tokenization/truncation for sample {sample_index}"
+            )
+        encoded_samples.append(torch.tensor(full_ids, dtype=torch.long))
+        label_samples.append(labels)
+
     return dict(
-        input_ids=input_ids,
-        labels=targets,
+        input_ids=torch.nn.utils.rnn.pad_sequence(
+            encoded_samples,
+            batch_first=True,
+            padding_value=tokenizer.pad_token_id,
+        ),
+        labels=torch.nn.utils.rnn.pad_sequence(
+            label_samples,
+            batch_first=True,
+            padding_value=IGNORE_INDEX,
+        ),
     )
 
 def preprocess(

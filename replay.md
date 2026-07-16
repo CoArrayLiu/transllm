@@ -37,6 +37,16 @@ cp  backup/config.json  checkpoints/llama3-8b/config.json
 
 ### commit fix some train-eval bugs
 
+修复test和train数据集std mean 不一致导致的评估不一致的bug   ./scripts/generate_prompt_data.sh
+
+断点续训会不会重新遍历数据集，断点续训指令
+
+检查点test与eval
+
+增加stage1检查点也会保存router权重
+
+### commit fix some checkpoints eval bugs
+
 
 Q:
 

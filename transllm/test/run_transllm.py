@@ -80,36 +80,33 @@ def run_eval(args, num_gpus):
             "with disjoint start_id/end_id ranges for multi-GPU evaluation"
         )
     prompt_file = load_prompting_file(args.prompting_file)
-    print('prompt_file_len', len(prompt_file))
-    prompt_file = prompt_file[args.start_id:args.end_id]
-    print('prompt_file_len', len(prompt_file))
-    chunk_size = len(prompt_file) // num_gpus
-    ans_handles = []
-    split_list = list(range(args.start_id, args.end_id, chunk_size))
-    idx_list = list(range(0, len(prompt_file), chunk_size))
-    if len(split_list) == num_gpus:
-        split_list.append(args.end_id)
-        idx_list.append(len(prompt_file))
-    elif len(split_list) == num_gpus + 1:
-        split_list[-1] = args.end_id
-        idx_list[-1] = len(prompt_file)
-    else:
-        raise ValueError('error in the number of list')
-
-    print('idx_list', idx_list)
-
-    if osp.exists(args.output_res_path) is False:
-        os.makedirs(args.output_res_path, exist_ok=True)
-
-    for idx in range(len(idx_list) - 1):
-        start_idx = idx_list[idx]
-        end_idx = idx_list[idx + 1]
-
-        start_split = split_list[idx]
-        end_split = split_list[idx + 1]
-        eval_model(
-            args, prompt_file[start_idx:end_idx], start_split, end_split
-            )
+    total_samples = len(prompt_file)
+    if args.start_id < 0 or args.start_id >= total_samples:
+        raise ValueError(
+            f"start_id={args.start_id} is outside [0, {total_samples})"
+        )
+    if args.end_id <= args.start_id or args.end_id > total_samples:
+        raise ValueError(
+            f"end_id={args.end_id} must be in "
+            f"({args.start_id}, {total_samples}]"
+        )
+    selected_prompts = prompt_file[args.start_id:args.end_id]
+    print(
+        "evaluation_sample_range:",
+        {
+            "start_id": args.start_id,
+            "end_id": args.end_id,
+            "num_samples": len(selected_prompts),
+            "total_samples": total_samples,
+        },
+    )
+    os.makedirs(args.output_res_path, exist_ok=True)
+    eval_model(
+        args,
+        selected_prompts,
+        args.start_id,
+        args.end_id,
+    )
 
 def replace_prompt_sd(routing_info: torch.Tensor, original_sentence: str,st_data_xh_tmp,st_data_xd_tmp,st_data_xw_tmp) -> str:
         traffic_values, history_time, future_time = extract_info(original_sentence=original_sentence)
@@ -231,18 +228,201 @@ def extract_info(original_sentence: str):
     return traffic_values, history_time, future_time
 
 # @ray.remote(num_gpus=1)
+def load_evaluation_model(args):
+    """Load either a merged model or a mathematically complete Stage 1 checkpoint."""
+    if args.checkpoint is None:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+        model = STLlamaForCausalLM.from_pretrained(
+            args.model_name,
+            num_prompts=4,
+            num_slots=4,
+            torch_dtype=torch.bfloat16,
+            use_cache=True,
+            device_map=None,
+            low_cpu_mem_usage=False,
+        )
+        model.set_tokenizer(tokenizer)
+        return tokenizer, model
+
+    checkpoint_path = osp.abspath(args.checkpoint)
+    required_files = (
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        "non_lora_trainables.bin",
+        "tokenizer_config.json",
+    )
+    missing_files = [
+        filename
+        for filename in required_files
+        if not osp.isfile(osp.join(checkpoint_path, filename))
+    ]
+    if missing_files:
+        raise FileNotFoundError(
+            f"Incomplete Stage 1 checkpoint {checkpoint_path}: missing {missing_files}"
+        )
+
+    with open(osp.join(checkpoint_path, "adapter_config.json"), "r") as handle:
+        adapter_config = json.load(handle)
+    base_model_path = args.base_model or adapter_config.get(
+        "base_model_name_or_path"
+    )
+    if not base_model_path:
+        raise ValueError(
+            "The checkpoint does not identify its base model; pass --base-model"
+        )
+
+    non_lora_path = osp.join(checkpoint_path, "non_lora_trainables.bin")
+    non_lora_state = torch.load(
+        non_lora_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+    required_router_prefixes = (
+        "prompt_router_sd.",
+        "prompt_router_pems08.",
+        "prompt_router_sz.",
+        "prompt_router_urbanev.",
+    )
+    missing_routers = [
+        prefix
+        for prefix in required_router_prefixes
+        if not any(prefix in key for key in non_lora_state)
+    ]
+    if missing_routers:
+        if args.fixed_prompt_index is None:
+            raise RuntimeError(
+                f"Checkpoint {checkpoint_path} predates complete router saving and "
+                f"cannot reproduce its exact evaluation behavior; missing "
+                f"{missing_routers}. Pass --fixed-prompt-index 0 to compare "
+                "Stage 1 prediction weights with a fixed prompt policy."
+            )
+        print(
+            "Checkpoint has no frozen router snapshot; using fixed prompt index "
+            f"{args.fixed_prompt_index} for Stage 1 comparison"
+        )
+
+    checkpoint_tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
+    tokenizer = AutoTokenizer.from_pretrained(base_model_path)
+    if checkpoint_tokenizer.pad_token is None:
+        raise ValueError("Checkpoint tokenizer has no pad token")
+    tokenizer.pad_token = checkpoint_tokenizer.pad_token
+    model = STLlamaForCausalLM.from_pretrained(
+        base_model_path,
+        num_prompts=4,
+        num_slots=4,
+        torch_dtype=torch.bfloat16,
+        use_cache=True,
+        device_map=None,
+        low_cpu_mem_usage=False,
+    )
+    model.set_tokenizer(tokenizer)
+    # The base Llama config does not create the ST projector. Training creates
+    # it explicitly after loading the base model, so checkpoint reconstruction
+    # must perform the same initialization before loading non-LoRA weights.
+    model.get_model().initialize_st_modules(
+        st_tower="ST_Encoder",
+        st_select_layer=-2,
+        pretrain_st_mlp_adapter=None,
+        fsdp=None,
+    )
+    model.config.pad_token_id = tokenizer.pad_token_id
+    model.config.use_st_start_end = True
+    model.initialize_st_tokenizer(
+        use_st_start_end=True,
+        tokenizer=tokenizer,
+        device="cpu",
+    )
+    required_st_tokens = (
+        DEFAULT_ST_PATCH_TOKEN,
+        DEFAULT_ST_START_TOKEN,
+        DEFAULT_ST_END_TOKEN,
+    )
+    if len(tokenizer) != len(checkpoint_tokenizer) or any(
+        tokenizer.convert_tokens_to_ids(token)
+        != checkpoint_tokenizer.convert_tokens_to_ids(token)
+        for token in required_st_tokens
+    ):
+        raise RuntimeError(
+            "Base/checkpoint tokenizer ST token layouts do not match"
+        )
+    tokenizer = checkpoint_tokenizer
+    model.set_tokenizer(tokenizer)
+
+    from peft import PeftModel
+    model = PeftModel.from_pretrained(
+        model,
+        checkpoint_path,
+        is_trainable=False,
+    )
+    incompatible = model.load_state_dict(non_lora_state, strict=False)
+    if incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Unexpected non-LoRA checkpoint keys: "
+            f"{incompatible.unexpected_keys}"
+        )
+    if not torch.cuda.is_available():
+        raise RuntimeError("Checkpoint evaluation requires a CUDA GPU")
+    # Merging an 8B LoRA model on CPU is unnecessarily slow. Evaluation is a
+    # CUDA-only path, so move the reconstructed PEFT model before merging.
+    model = model.to("cuda")
+    model = model.merge_and_unload()
+    # The trained projector is FP32, while generation supplies BF16 ST
+    # features. Use the model compute dtype for inference Linear operations.
+    model.get_model().st_projector.to(dtype=torch.bfloat16)
+    model.get_model().st_projector_sh.to(dtype=torch.bfloat16)
+    model.set_tokenizer(tokenizer)
+    model.config.use_cache = True
+    print(
+        f"Loaded Stage 1 checkpoint {checkpoint_path} with base model "
+        f"{base_model_path}"
+    )
+    return tokenizer, model
+
+
+def select_routing_info(
+    args,
+    router,
+    st_tower,
+    st_inputs,
+    sp_matrix,
+    se_matrix,
+    data_type,
+    node_feature,
+    region_start,
+    region_end,
+):
+    if args.fixed_prompt_index is not None:
+        return torch.full(
+            (4,),
+            args.fixed_prompt_index,
+            dtype=torch.long,
+            device=st_inputs.device,
+        )
+    _, node_embedding = st_tower(
+        st_inputs,
+        sp_matrix,
+        se_matrix,
+        data_type,
+        node_feature,
+    )
+    selected = node_embedding[:, :, region_start:region_end, :]
+    router_dtype = next(router.parameters()).dtype
+    return router.select_prompts(
+        selected.reshape(selected.shape[0], -1).to(router_dtype),
+        track_episode=False,
+        deterministic=True,
+    ).squeeze(0)
+
+
 @torch.inference_mode()
 def eval_model(args, prompt_file, start_idx, end_idx):
     
     disable_torch_init()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     print('start loading')
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    print('finish loading')
-
-    print('start loading')
-
-    model = STLlamaForCausalLM.from_pretrained(args.model_name, num_prompts=4, num_slots=4,torch_dtype=torch.bfloat16, use_cache=True,device_map=None,
-                                                  low_cpu_mem_usage=False).to("cuda")
+    tokenizer, model = load_evaluation_model(args)
+    model = model.to("cuda")
     model.get_st_tower().to(device="cuda", dtype=torch.float32)
     model.eval()
     print('finish loading')
@@ -320,37 +500,57 @@ def eval_model(args, prompt_file, start_idx, end_idx):
             node_feature = graph["nodes_feature"].cuda()
             sp_matrix = graph["sp_matrix"].cuda()
             se_matrix = graph["se_matrix"].cuda()
-            _, node_embedding = model.model.st_tower(st_data_x_copy[..., :3],sp_matrix,se_matrix,1,node_feature)
-            selected = node_embedding[:, :, region_start:region_end, :]
-            routing_info = model.prompt_router_sd.select_prompts(selected.reshape(selected.shape[0],-1).to(torch.bfloat16), track_episode=False, deterministic=True).squeeze(0)
-            qs = replace_prompt_sd(routing_info,original_sentence,st_data_xh_tmp,st_data_xd_tmp,st_data_xw_tmp)
+            routing_info = select_routing_info(
+                args, model.prompt_router_sd, model.model.st_tower,
+                st_data_x_copy[..., :3], sp_matrix, se_matrix, 1,
+                node_feature, region_start, region_end,
+            )
+            qs = replace_prompt_sd(
+                routing_info, original_sentence,
+                st_data_xh_tmp, st_data_xd_tmp, st_data_xw_tmp,
+            )
         elif dataset == "SZ":
             graph = graphs[dataset]
             node_feature = graph["nodes_feature"].cuda()
             sp_matrix = graph["sp_matrix"].cuda()
             se_matrix = graph["se_matrix"].cuda()
-            _, node_embedding = model.model.st_tower(st_data_x_copy[..., :3],sp_matrix,se_matrix,2,node_feature)
-            selected = node_embedding[:, :, region_start:region_end, :]
-            routing_info = model.prompt_router_sz.select_prompts(selected.reshape(selected.shape[0],-1).to(torch.bfloat16), track_episode=False, deterministic=True).squeeze(0)
-            qs = replace_prompt_sz(routing_info,original_sentence,st_data_xh_tmp,st_data_xd_tmp,st_data_xw_tmp)
+            routing_info = select_routing_info(
+                args, model.prompt_router_sz, model.model.st_tower,
+                st_data_x_copy[..., :3], sp_matrix, se_matrix, 2,
+                node_feature, region_start, region_end,
+            )
+            qs = replace_prompt_sz(
+                routing_info, original_sentence,
+                st_data_xh_tmp, st_data_xd_tmp, st_data_xw_tmp,
+            )
         elif dataset == "pems08":
             graph = graphs[dataset]
             node_feature = None
             sp_matrix = graph["sp_matrix"].cuda()
             se_matrix = graph["se_matrix"].cuda()
-            _, node_embedding = model.model.st_tower(st_data_x_copy[..., :3],sp_matrix,se_matrix,6,node_feature)
-            selected = node_embedding[:, :, region_start:region_end, :]
-            routing_info = model.prompt_router_pems08.select_prompts(selected.reshape(selected.shape[0],-1).to(torch.bfloat16), track_episode=False, deterministic=True).squeeze(0)
-            qs = replace_prompt_sd(routing_info,original_sentence,st_data_xh_tmp,st_data_xd_tmp,st_data_xw_tmp)
+            routing_info = select_routing_info(
+                args, model.prompt_router_pems08, model.model.st_tower,
+                st_data_x_copy[..., :3], sp_matrix, se_matrix, 6,
+                node_feature, region_start, region_end,
+            )
+            qs = replace_prompt_sd(
+                routing_info, original_sentence,
+                st_data_xh_tmp, st_data_xd_tmp, st_data_xw_tmp,
+            )
         elif dataset == "urbanev":
             graph = graphs[dataset]
             node_feature = graph["nodes_feature"].cuda()
             sp_matrix = graph["sp_matrix"].cuda()
             se_matrix = graph["se_matrix"].cuda()
-            _, node_embedding = model.model.st_tower(st_data_x_copy[..., :3],sp_matrix,se_matrix,5,node_feature)
-            selected = node_embedding[:, :, region_start:region_end, :]
-            routing_info = model.prompt_router_urbanev.select_prompts(selected.reshape(selected.shape[0],-1).to(torch.bfloat16), track_episode=False, deterministic=True).squeeze(0)
-            qs = model.replace_prompt_urbanev(routing_info,original_sentence,st_data_xh_tmp,st_data_xd_tmp,st_data_xw_tmp)
+            routing_info = select_routing_info(
+                args, model.prompt_router_urbanev, model.model.st_tower,
+                st_data_x_copy[..., :3], sp_matrix, se_matrix, 5,
+                node_feature, region_start, region_end,
+            )
+            qs = model.replace_prompt_urbanev(
+                routing_info, original_sentence,
+                st_data_xh_tmp, st_data_xd_tmp, st_data_xw_tmp,
+            )
         else:
             raise ValueError(f"Unsupported evaluation dataset: {dataset}")
 
@@ -411,7 +611,43 @@ def eval_model(args, prompt_file, start_idx, end_idx):
             batch_size = hidden_states.shape[0]
 
             feature_nums = 1
-            if start_inx.shape[0] == 3 and end_inx.shape[0] == 3 and end_inx[2]-start_inx[2]==12:
+            input_token_len = input_ids.shape[1]
+            generated_starts = start_inx[start_inx >= input_token_len]
+            history_span_valid = (
+                start_inx.numel() >= 1
+                and end_inx.numel() >= 1
+                and int(end_inx[0].item() - start_inx[0].item() - 1) == 12
+            )
+            generated_patch_start = (
+                int(generated_starts[0].item()) + 1
+                if generated_starts.numel() > 0
+                else -1
+            )
+            generated_patch_end = generated_patch_start + 12
+            generated_patch_tokens = output_ids[
+                0, generated_patch_start:generated_patch_end
+            ]
+            prediction_span_valid = (
+                generated_starts.numel() > 0
+                and generated_patch_tokens.numel() == 12
+                and bool(
+                    torch.all(
+                        generated_patch_tokens == st_config.st_patch_token
+                    ).item()
+                )
+            )
+            if history_span_valid and prediction_span_valid:
+                generated_ends = end_inx[
+                    end_inx > int(generated_starts[0].item())
+                ]
+                if (
+                    generated_ends.numel() == 0
+                    or int(generated_ends[0].item()) != generated_patch_end
+                ):
+                    print(
+                        "warning: generated prediction span has at least 12 patch "
+                        "tokens but no exact closing ST token; using the first 12"
+                    )
                 st_pre_embs1 = hidden_states[:,
                             start_inx[0]+1:end_inx[0],
                             :].detach().reshape(batch_size, -1, feature_nums, model.config.hidden_size)
@@ -426,7 +662,7 @@ def eval_model(args, prompt_file, start_idx, end_idx):
 
 
                 st_pre_embs2 = hidden_states[:,
-                            start_inx[2]+1:end_inx[2],
+                            generated_patch_start:generated_patch_end,
                             :].reshape(batch_size, -1, feature_nums, model.config.hidden_size)
                 st_pre_out2 = model.relu(future_head(st_pre_embs2))
 
@@ -451,7 +687,21 @@ def eval_model(args, prompt_file, start_idx, end_idx):
                     }
                 )
             else:
-                print('========error========')
+                generated_suffix = tokenizer.decode(
+                    output_ids[0, input_ids.shape[1]:],
+                    skip_special_tokens=False,
+                )
+                print(
+                    "invalid_st_generation:",
+                    {
+                        "start_token_count": int(start_inx.numel()),
+                        "end_token_count": int(end_inx.numel()),
+                        "generated_token_count": int(
+                            output_ids.shape[1] - input_ids.shape[1]
+                        ),
+                        "generated_suffix": generated_suffix,
+                    },
+                )
                 error_i = error_i + 1
                 print(error_i)
 
@@ -460,6 +710,18 @@ def eval_model(args, prompt_file, start_idx, end_idx):
     if not res_data:
         raise RuntimeError(
             "Evaluation produced no valid predictions; inspect ST token positions"
+        )
+    if torch.cuda.is_available():
+        print(
+            "evaluation_gpu_stats:",
+            {
+                "peak_allocated_gib": round(
+                    torch.cuda.max_memory_allocated() / (1024 ** 3), 3
+                ),
+                "peak_reserved_gib": round(
+                    torch.cuda.max_memory_reserved() / (1024 ** 3), 3
+                ),
+            },
         )
     return
 
@@ -476,6 +738,28 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name", type=str, default=output_model)
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Stage 1 checkpoint-N containing adapter and non-LoRA state",
+    )
+    parser.add_argument(
+        "--base-model",
+        type=str,
+        default="./checkpoints/llama3-8b",
+        help="Base Llama model used to reconstruct --checkpoint",
+    )
+    parser.add_argument(
+        "--fixed-prompt-index",
+        type=int,
+        choices=range(4),
+        default=None,
+        help=(
+            "Use one fixed prompt variant for all four slots. This permits fair "
+            "Stage 1 comparison of old checkpoints that did not save routers."
+        ),
+    )
     parser.add_argument("--prompting_file", type=str, default=datapath)
     parser.add_argument("--conv-mode", type=str, default=None)
     parser.add_argument("--st_data_path", type=str, default=st_data_path)
@@ -484,10 +768,22 @@ if __name__ == "__main__":
     parser.add_argument("--max_new_tokens", type=int, default=256)
 
     parser.add_argument("--start_id", type=int, default=start_id)
-    parser.add_argument("--end_id", type=int, default=end_id)
+    range_group = parser.add_mutually_exclusive_group()
+    range_group.add_argument("--end_id", type=int, default=end_id)
+    range_group.add_argument(
+        "--num-samples",
+        type=int,
+        default=None,
+        help="Evaluate this many samples starting at --start_id",
+    )
 
     args = parser.parse_args()
 
-    if args.end_id is None:
-        args.end_id = len(load_prompting_file(args.prompting_file))
+    total_samples = len(load_prompting_file(args.prompting_file))
+    if args.num_samples is not None:
+        if args.num_samples <= 0:
+            parser.error("--num-samples must be positive")
+        args.end_id = min(args.start_id + args.num_samples, total_samples)
+    elif args.end_id is None:
+        args.end_id = total_samples
     run_eval(args, args.num_gpus)

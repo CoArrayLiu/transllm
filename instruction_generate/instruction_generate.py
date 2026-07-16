@@ -175,6 +175,33 @@ data_all = []
 
 # =============================== data Generation =============================== #
 x_trn,x_1d,x_1w, y_trn, mean, std = get_dataloader(args)#生成X，Y
+
+# Test inputs must use statistics learned from the supervised training window.
+# Computing mean/std from held-out data leaks its distribution and gives the ST
+# encoder a different normalization at evaluation time.
+stats_dir = "./data/prompt_data"
+os.makedirs(stats_dir, exist_ok=True)
+stats_path = os.path.join(
+    stats_dir,
+    f"{args.dataset_name}_supervised_stats.json",
+)
+if args.for_supervised:
+    with open(stats_path, "w") as stats_file:
+        json.dump({"mean": float(mean), "std": float(std)}, stats_file)
+elif args.for_test:
+    if not os.path.isfile(stats_path):
+        raise FileNotFoundError(
+            f"Missing training normalization statistics: {stats_path}. "
+            "Generate the supervised split before the test split."
+        )
+    with open(stats_path, "r") as stats_file:
+        train_stats = json.load(stats_file)
+    mean = float(train_stats["mean"])
+    std = float(train_stats["std"])
+    if std <= 0:
+        raise ValueError(f"Invalid training std in {stats_path}: {std}")
+    print("Using supervised normalization stats for test:", mean, std)
+
 spt_x,spt_xd,spt_xw, spt_y, train_len = get_pretrain_task_batch(args, x_trn,x_1d,x_1w, y_trn, shuffle=args.shuffle)# 将训练数据划分为批次并打乱
 # mean, std =215.60181205171222,169.45704339035726
 for i in range(train_len):

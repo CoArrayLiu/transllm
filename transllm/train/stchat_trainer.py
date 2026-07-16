@@ -77,10 +77,21 @@ class STChatTrainer(Trainer):
         # every Trainer checkpoint so resume is mathematically complete.
         output_dir = output_dir or self.args.output_dir
         model_to_save = unwrap_model(self.model)
+        # Frozen routers still affect prompt selection in Stage 1 and therefore
+        # belong to the mathematical checkpoint even though they have no grad.
+        inference_router_names = (
+            "prompt_router_sd.",
+            "prompt_router_pems08.",
+            "prompt_router_sz.",
+            "prompt_router_urbanev.",
+        )
         trainable_names = {
             name
             for name, parameter in model_to_save.named_parameters()
-            if parameter.requires_grad and "lora_" not in name
+            if (
+                (parameter.requires_grad and "lora_" not in name)
+                or any(router_name in name for router_name in inference_router_names)
+            )
         }
         complete_state = state_dict if state_dict is not None else model_to_save.state_dict()
         non_lora_state = {

@@ -6,7 +6,9 @@ Action:
 增加了修改数据集文件夹名称的脚本
 
 增加了生成  指令 和 缓存文件 的 bash脚本  ./scripts
- 
+
+### commit fix bugs
+
 ```bash
 ./scripts/normalize_dataset_paths.sh
 ./scripts/generate_cache_matrices.sh
@@ -24,6 +26,10 @@ modelscope download \
 
 cp  backup/config.json  checkpoints/llama3-8b/config.json
 ```
+
+### commit  configuration
+
+修改了SH数据集相关代码
 
 
 Q:

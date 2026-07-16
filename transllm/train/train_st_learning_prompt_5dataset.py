@@ -76,8 +76,6 @@ class DataArguments:
                            metadata={"help": "Path to the training data."})
     data_path_urbanev: str = field(default=None,
                            metadata={"help": "Path to the training data."})
-    data_path_sh: str = field(default=None,
-                           metadata={"help": "Path to the training data."})
     lazy_preprocess: bool = False
     is_st: bool = False
     sep_st_conv_front: bool = False
@@ -87,7 +85,6 @@ class DataArguments:
     st_data_path_pems08: Optional[str] = field(default=None)
     st_data_path_sz: Optional[str] = field(default=None)
     st_data_path_urbanev: Optional[str] = field(default=None)
-    st_data_path_sh: Optional[str] = field(default=None)
     image_aspect_ratio: str = 'square'
 
 
@@ -125,6 +122,8 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_weight_path: str = ""
     lora_bias: str = "none"
     disable_tqdm: bool = False
+    training_stage: str = "llm"
+    resume_checkpoint: Optional[str] = None
 
 def get_dataset_info(dataset):
     base_dir = os.getcwd() + '/data/'
@@ -134,7 +133,6 @@ def get_dataset_info(dataset):
          'GBA': [base_dir+'st_data/gba', base_dir+'st_data/gba/gba_rn_adj.npy', 2352],
          'SD': [base_dir+'st_data/sd', base_dir+'st_data/sd/sd_rn_adj.npy', 673],
          'shenzhen':[base_dir+'st_data/shenzhen', base_dir+'st_data/shenzhen/shenzhen_adj.npy', 247],
-         'shanghai':[base_dir+'st_data/shanghai', base_dir+'st_data/shanghai/shanghai_adj.npy', 891],
          'urbanev':[base_dir+'st_data/urbanev', base_dir+'st_data/urbanev/urbanev_adj.npy', 275],
          'pems08':[base_dir+'st_data/pems08', base_dir+'st_data/pems08/pems08_adj.npy', 170],
          'pems03':[base_dir+'st_data/pems03', base_dir+'st_data/pems03/pems03_adj_clip.npy', 170],
@@ -192,92 +190,49 @@ def read_node_information4(args):
     return final_features
 
 def load_adj(args):
-    nodes_feature1 = read_node_information(args)
-    nodes_feature1 = torch.from_numpy(nodes_feature1).float().to(args.device)
-    data_path, adj_path, node_num = get_dataset_info(args.dataset1)
-    adj_mx = load_adj_from_numpy(adj_path)
-    adj_mx = adj_mx - np.eye(node_num)
-    sp_matrix = adj_mx + np.transpose(adj_mx)
-    rows, cols = np.where(sp_matrix)
-    sp_matrix = torch.tensor([rows, cols], dtype=torch.long).to(args.device)
-    batch_offsets = torch.arange(args.bs, device=args.device) * node_num
-    sp_matrix = sp_matrix.unsqueeze(2) + batch_offsets.view(1, 1, -1)
-    sp_matrix = sp_matrix.reshape(2,-1)
+    """Load graph inputs for the four forecasting datasets only.
 
+    The ST-Encoder task ids are part of the author's pretrained checkpoint and
+    intentionally remain 1, 2, 5 and 6.
+    """
+    def batched_edges(matrix, node_num):
+        rows, cols = np.where(matrix)
+        edge_index = torch.tensor(np.array([rows, cols]), dtype=torch.long, device=args.device)
+        offsets = torch.arange(args.bs, device=args.device) * node_num
+        return (edge_index.unsqueeze(2) + offsets.view(1, 1, -1)).reshape(2, -1)
 
-    nodes_feature2 = read_node_information2(args)
-    nodes_feature2 = torch.from_numpy(nodes_feature2).float().to(args.device)
-    se_matrix =np.load(os.path.join(data_path, "cached_dist_matrix.npy"))
-    rows, cols = np.where(se_matrix)
-    se_matrix = torch.tensor([rows, cols], dtype=torch.long).to(args.device)
-    se_matrix = se_matrix.unsqueeze(2) + batch_offsets.view(1, 1, -1)
-    se_matrix = se_matrix.reshape(2,-1)
+    def graph(dataset_name, task_type, node_features=None, make_sd_undirected=False):
+        data_path, adj_path, node_num = get_dataset_info(dataset_name)
+        adjacency = load_adj_from_numpy(adj_path)
+        if make_sd_undirected:
+            adjacency = adjacency - np.eye(node_num)
+            adjacency = adjacency + adjacency.T
+        return {
+            "nodes_feature": node_features,
+            "sp_matrix": batched_edges(adjacency, node_num),
+            "se_matrix": batched_edges(np.load(os.path.join(data_path, "cached_dist_matrix.npy")), node_num),
+            "st_encoder_type": task_type,
+            "node_num": node_num,
+        }
 
-    data_path2, adj_path2, node_num2 = get_dataset_info(args.dataset2)
-    sp_matrix2 = load_adj_from_numpy(adj_path2)
-    rows, cols = np.where(sp_matrix2)
-    sp_matrix2 = torch.tensor([rows, cols], dtype=torch.long).to(args.device)
-    batch_offsets = torch.arange(args.bs, device=args.device) * node_num2
-    sp_matrix2 = sp_matrix2.unsqueeze(2) + batch_offsets.view(1, 1, -1)
-    sp_matrix2 = sp_matrix2.reshape(2,-1)
-
-    se_matrix2 =np.load(os.path.join(data_path2, "cached_dist_matrix.npy"))
-    rows, cols = np.where(se_matrix2)
-    se_matrix2 = torch.tensor([rows, cols], dtype=torch.long).to(args.device)
-    se_matrix2 = se_matrix2.unsqueeze(2) + batch_offsets.view(1, 1, -1)
-    se_matrix2 = se_matrix2.reshape(2,-1)
-
-    data_path3, adj_path3, node_num3 = get_dataset_info(args.dataset3)
-    sp_matrix3 = load_adj_from_numpy(adj_path3)
-    rows, cols = np.where(sp_matrix3)
-    sp_matrix3 = torch.tensor([rows, cols], dtype=torch.long).to(args.device)
-    batch_offsets = torch.arange(args.bs, device=args.device) * node_num3
-    sp_matrix3 = sp_matrix3.unsqueeze(2) + batch_offsets.view(1, 1, -1)
-    sp_matrix3 = sp_matrix3.reshape(2,-1)
-
-    se_matrix3 =np.load(os.path.join(data_path3, "cached_demand_matrix.npy"))
-    rows, cols = np.where(se_matrix3)
-    se_matrix3 = torch.tensor([rows, cols], dtype=torch.long).to(args.device)
-    se_matrix3 = se_matrix3.unsqueeze(2) + batch_offsets.view(1, 1, -1)
-    se_matrix3 = se_matrix3.reshape(2,-1)
-
-    se_matrix3_2 =np.load(os.path.join(data_path3, "cached_waiting_matrix.npy"))
-    rows, cols = np.where(se_matrix3_2) 
-    se_matrix3_2 = torch.tensor([rows, cols], dtype=torch.long).to(args.device)
-    se_matrix3_2 = se_matrix3_2.unsqueeze(2) + batch_offsets.view(1, 1, -1)
-    se_matrix3_2 = se_matrix3_2.reshape(2,-1)
-    
-    nodes_feature4 = read_node_information4(args)
-    nodes_feature4 = torch.from_numpy(nodes_feature4).float().to(args.device)
-    data_path4, adj_path4, node_num4 = get_dataset_info(args.dataset4)
-    sp_matrix4 = load_adj_from_numpy(adj_path4)
-    rows, cols = np.where(sp_matrix4)
-    sp_matrix4 = torch.tensor([rows, cols], dtype=torch.long).to(args.device)
-    batch_offsets = torch.arange(args.bs, device=args.device) * node_num4
-    sp_matrix4 = sp_matrix4.unsqueeze(2) + batch_offsets.view(1, 1, -1)
-    sp_matrix4 = sp_matrix4.reshape(2,-1)
-
-    se_matrix4 =np.load(os.path.join(data_path4, "cached_dist_matrix.npy"))
-    rows, cols = np.where(se_matrix4)
-    se_matrix4 = torch.tensor([rows, cols], dtype=torch.long).to(args.device)
-    se_matrix4 = se_matrix4.unsqueeze(2) + batch_offsets.view(1, 1, -1)
-    se_matrix4 = se_matrix4.reshape(2,-1)
-
-    data_path5, adj_path5, node_num5 = get_dataset_info(args.dataset5)
-    sp_matrix5 = load_adj_from_numpy(adj_path5)
-    rows, cols = np.where(sp_matrix5)
-    sp_matrix5 = torch.tensor([rows, cols], dtype=torch.long).to(args.device)
-    batch_offsets = torch.arange(args.bs, device=args.device) * node_num5
-    sp_matrix5 = sp_matrix5.unsqueeze(2) + batch_offsets.view(1, 1, -1)
-    sp_matrix5 = sp_matrix5.reshape(2,-1)
-
-    se_matrix5 =np.load(os.path.join(data_path5, "cached_dist_matrix.npy"))
-    rows, cols = np.where(se_matrix5)
-    se_matrix5 = torch.tensor([rows, cols], dtype=torch.long).to(args.device)
-    se_matrix5 = se_matrix5.unsqueeze(2) + batch_offsets.view(1, 1, -1)
-    se_matrix5 = se_matrix5.reshape(2,-1)
-
-    return nodes_feature1,sp_matrix,se_matrix,nodes_feature2,sp_matrix2,se_matrix2,sp_matrix3,se_matrix3,se_matrix3_2,nodes_feature4,sp_matrix4,se_matrix4,sp_matrix5,se_matrix5
+    graphs = {
+        "SD": graph(
+            args.dataset1, 1,
+            torch.from_numpy(read_node_information(args)).float().to(args.device),
+            make_sd_undirected=True,
+        ),
+        "SZ": graph(
+            args.dataset2, 2,
+            torch.from_numpy(read_node_information2(args)).float().to(args.device),
+        ),
+        "urbanev": graph(
+            args.dataset4, 5,
+            torch.from_numpy(read_node_information4(args)).float().to(args.device),
+        ),
+        "pems08": graph(args.dataset5, 6),
+    }
+    assert set(graphs) == {"SD", "SZ", "pems08", "urbanev"}
+    return graphs
 
 def load_adj_from_numpy(numpy_file):
     return np.load(numpy_file)
@@ -344,6 +299,34 @@ def find_all_linear_names(model):
     return list(lora_module_names)
 
 
+def configure_trainable_parameters(model, training_stage):
+    """Apply the exact parameter ownership for one of the two training stages."""
+    if training_stage not in {"llm", "router"}:
+        raise ValueError(f"Unsupported training stage: {training_stage}")
+
+    causal_model = model.get_base_model() if hasattr(model, "get_base_model") else model
+    causal_model.training_stage = training_stage
+    model.requires_grad_(False)
+
+    if training_stage == "llm":
+        for name, parameter in model.named_parameters():
+            if "lora_" in name:
+                parameter.requires_grad = True
+        model.get_model().st_projector.requires_grad_(True)
+        for head_index in range(1, 13):
+            getattr(model, f"st_pred_linear_{head_index}").requires_grad_(True)
+        model.lm_head.requires_grad_(True)
+    else:
+        for router_name in ("prompt_router_sd", "prompt_router_pems08", "prompt_router_sz", "prompt_router_urbanev"):
+            getattr(model, router_name).requires_grad_(True)
+
+    model.get_st_tower().requires_grad_(False)
+    model.get_model().st_projector_sh.requires_grad_(False)
+    model.st_pred_linear_dispatch.requires_grad_(False)
+    model.prompt_router_sh.requires_grad_(False)
+    return {name for name, parameter in model.named_parameters() if parameter.requires_grad}
+
+
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
                                    output_dir: str):
     """Collects the state dict and dump to disk."""
@@ -391,7 +374,6 @@ def get_config():
     parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--dataset1', type=str, default='SD')
     parser.add_argument('--dataset2', type=str, default='shenzhen')
-    parser.add_argument('--dataset3', type=str, default='shanghai')
     parser.add_argument('--dataset4', type=str, default='urbanev')
     parser.add_argument('--dataset5', type=str, default='pems08')
     # if need to use the data from multiple years, please use underline to separate them, e.g., 2018_2019
@@ -414,7 +396,7 @@ def get_config():
     parser.add_argument('--lrate', type=float, default=1e-3)
     parser.add_argument('--wdecay', type=float, default=0)
     parser.add_argument('--clip_grad_value', type=float, default=5)
-    args = parser.parse_args() 
+    args, _ = parser.parse_known_args()
     return args
 
 
@@ -444,7 +426,7 @@ class SupervisedDataset(Dataset):
 
 
 class LazySupervisedDataset_ST(Dataset):
-    def __init__(self, data_path_sd: str, data_path_sz: str,data_path_sh: str, data_path_pems08: str, data_path_urbanev: str,
+    def __init__(self, data_path_sd: str, data_path_sz: str, data_path_pems08: str, data_path_urbanev: str,
                  tokenizer: transformers.PreTrainedTokenizer,
                  st_cfg: dict,
                  batch_size: int = 16,
@@ -455,7 +437,6 @@ class LazySupervisedDataset_ST(Dataset):
         self.pems08_list_data_dict = json.load(open(data_path_pems08, "r"))
         self.sz_list_data_dict = json.load(open(data_path_sz, "r"))
         self.urbanev_list_data_dict = json.load(open(data_path_urbanev, "r"))
-        self.sh_list_data_dict = json.load(open(data_path_sh, "r"))
 
         self.tokenizer = tokenizer
         self.st_cfg = st_cfg
@@ -463,49 +444,9 @@ class LazySupervisedDataset_ST(Dataset):
         self.st_data_all_pems08 = pickle.load(open(kwargs.get('st_data_path_pems08'), 'rb'))
         self.st_data_all_sz = pickle.load(open(kwargs.get('st_data_path_sz'), 'rb'))
         self.st_data_all_urbanev = pickle.load(open(kwargs.get('st_data_path_urbanev'), 'rb'))
-        self.st_data_all_sh = pickle.load(open(kwargs.get('st_data_path_sh'), 'rb'))
         args = get_config()
         args.bs = batch_size
-        self.nodes_feature1,self.sp_matrix1,self.se_matrix1,\
-            self.nodes_feature2,self.sp_matrix2,self.se_matrix2,\
-                self.sp_matrix3,self.se_matrix3,self.se_matrix4,self.nodes_feature5,\
-                    self.sp_matrix5,self.se_matrix5,self.sp_matrix6,self.se_matrix6=load_adj(args)
-
-        csv_file_path = "third_task_preprocess/square_grid_3km_shanghai.csv"
-        df = pd.read_csv(csv_file_path)
-        position_to_id = {}
-        for _, row in df.iterrows():
-            position_to_id[(row['row'], row['col'])] = row['grid_id']
-        result = []
-        valid_grids_data = []  
-        valid_count = 0
-
-        # Define the relative positions for 9 directions (in order: center, top-left, top, top-right, left, right, bottom-left, bottom, bottom-right)
-        directions = [(0, 0), (-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
-
-        for idx, row in df.iterrows():
-            grid_row = row['row']
-            grid_col = row['col']
-            
-            all_neighbors_exist = True
-            nine_direction_ids = []
-            
-            for dr, dc in directions:
-                neighbor_pos = (grid_row + dr, grid_col + dc)
-                if neighbor_pos in position_to_id:
-                    nine_direction_ids.append(position_to_id[neighbor_pos]-1)
-                else:
-                    all_neighbors_exist = False
-                    break
-
-            if all_neighbors_exist:
-                result.append(1)
-                valid_grids_data.append(nine_direction_ids)
-                valid_count += 1
-            else:
-                result.append(0)
-
-        self.nine_direction_array = np.array(valid_grids_data) if valid_grids_data else np.array([]).reshape(0, 9)
+        self.graphs = load_adj(args)
         self.batch_size = batch_size
 
         self.build_index_sequence()
@@ -517,12 +458,10 @@ class LazySupervisedDataset_ST(Dataset):
         pems08_indices = list(range(len(self.pems08_list_data_dict)))
         sz_indices = list(range(len(self.sz_list_data_dict)))
         urbanev_indices = list(range(len(self.urbanev_list_data_dict)))
-        sh_indices = list(range(len(self.sh_list_data_dict)))
         random.shuffle(sd_indices)
         random.shuffle(pems08_indices)
         random.shuffle(sz_indices)
         random.shuffle(urbanev_indices)
-        random.shuffle(sh_indices)
 
         def split_batches(indices):
             return [indices[i:i+self.batch_size]
@@ -533,10 +472,9 @@ class LazySupervisedDataset_ST(Dataset):
         pems08_batches = split_batches(pems08_indices)
         sz_batches = split_batches(sz_indices)
         urbanev_batches = split_batches(urbanev_indices)
-        sh_batches = split_batches(sh_indices)
 
         self.index_sequence = []
-        sd_i, sz_i, sh_i, pems08_i, urbanev_i = 0, 0, 0, 0, 0
+        sd_i, sz_i, pems08_i, urbanev_i = 0, 0, 0, 0
 
         while sd_i < len(sd_batches):
             # SD batch
@@ -566,15 +504,8 @@ class LazySupervisedDataset_ST(Dataset):
                 for idx in urbanev_batches[urbanev_i % len(urbanev_batches)]:
                     self.index_sequence.append(('urbanev', idx))
                 urbanev_i += 1
+        assert {name for name, _ in self.index_sequence} == {"SD", "pems08", "SZ", "urbanev"}
 
-
-            # SH batch
-            if len(sh_batches) > 0:
-                for idx in sh_batches[sh_i % len(sh_batches)]:
-                    self.index_sequence.append(('SH', idx))
-                sh_i += 1
-
-        
     def __len__(self):
         return len(self.index_sequence)
 
@@ -583,39 +514,21 @@ class LazySupervisedDataset_ST(Dataset):
         if dataset_type == 'SD':
             sources = self.sd_list_data_dict[real_idx]
             st_data_all = self.st_data_all_sd
-            nodes_feature = self.nodes_feature1
-            sp_matrix = self.sp_matrix1
-            se_matrix = self.se_matrix1
-            se_matrix_waiting = None
+            graph = self.graphs[dataset_type]
         elif dataset_type == 'SZ':
             sources = self.sz_list_data_dict[real_idx]
             st_data_all = self.st_data_all_sz
-            nodes_feature = self.nodes_feature2
-            sp_matrix = self.sp_matrix2
-            se_matrix = self.se_matrix2
-            se_matrix_waiting = None
-        elif dataset_type == 'SH':
-            sources = self.sh_list_data_dict[real_idx]
-            st_data_all = self.st_data_all_sh
-            nodes_feature = None
-            sp_matrix = self.sp_matrix3
-            se_matrix = self.se_matrix3
-            se_matrix_waiting = self.se_matrix4
-            neighbors = self.nine_direction_array
+            graph = self.graphs[dataset_type]
         elif dataset_type == 'pems08':
             sources = self.pems08_list_data_dict[real_idx]
             st_data_all = self.st_data_all_pems08
-            nodes_feature = None
-            sp_matrix = self.sp_matrix6
-            se_matrix = self.se_matrix6
-            se_matrix_waiting = None
+            graph = self.graphs[dataset_type]
         elif dataset_type == 'urbanev':
             sources = self.urbanev_list_data_dict[real_idx]
             st_data_all = self.st_data_all_urbanev
-            nodes_feature = self.nodes_feature5
-            sp_matrix = self.sp_matrix5
-            se_matrix = self.se_matrix5
-            se_matrix_waiting = None
+            graph = self.graphs[dataset_type]
+        else:
+            raise ValueError(f"Unsupported dataset in four-dataset training: {dataset_type}")
         if dataset_type == 'pems08' or dataset_type == 'urbanev':
             region_start = int(sources["id"].split('_')[3])
             region_end = int(sources["id"].split('_')[4])
@@ -629,27 +542,20 @@ class LazySupervisedDataset_ST(Dataset):
         data_dict['st_data_y'] = torch.tensor(st_data_all[i4data_all]['data_y'], dtype=torch.float32)
         data_dict['mean'] = torch.tensor(st_data_all[i4data_all]['mean'], dtype=torch.float32)
         data_dict['std'] = torch.tensor(st_data_all[i4data_all]['std'], dtype=torch.float32)
-        if dataset_type == 'SH':
-            data_dict['st_data_x_waiting'] = torch.tensor(st_data_all[i4data_all]['data_x_waiting'], dtype=torch.float32)
-            data_dict['st_data_y_waiting'] = torch.tensor(st_data_all[i4data_all]['data_y_waiting'], dtype=torch.float32)
-            data_dict['mean_waiting'] = torch.tensor(st_data_all[i4data_all]['mean_waiting'], dtype=torch.float32)
-            data_dict['std_waiting'] = torch.tensor(st_data_all[i4data_all]['std_waiting'], dtype=torch.float32)
-            data_dict['real_prob'] = torch.tensor(st_data_all[i4data_all]['real_prob'], dtype=torch.float32)
-        else:
-            data_dict['st_data_x_waiting'] = None
-            data_dict['st_data_y_waiting'] = None
-            data_dict['mean_waiting'] = None
-            data_dict['std_waiting'] = None
-            data_dict['real_prob'] = None
+        data_dict['st_data_x_waiting'] = None
+        data_dict['st_data_y_waiting'] = None
+        data_dict['mean_waiting'] = None
+        data_dict['std_waiting'] = None
+        data_dict['real_prob'] = None
         data_dict['region_start'] = region_start
         data_dict['region_end'] = region_end
         data_dict['sources'] = [sources]
-        data_dict['sp_matrix'] = torch.tensor(sp_matrix)
-        data_dict['se_matrix'] = torch.tensor(se_matrix)
+        data_dict['sp_matrix'] = graph['sp_matrix']
+        data_dict['se_matrix'] = graph['se_matrix']
         if dataset_type == 'SD' or dataset_type == 'SZ' or dataset_type == 'urbanev':
             data_dict['st_data_xd'] = torch.tensor(st_data_all[i4data_all]['data_x_1d'], dtype=torch.float32)
             data_dict['st_data_xw'] = torch.tensor(st_data_all[i4data_all]['data_x_1w'], dtype=torch.float32)
-            data_dict['nodes_feature'] = torch.tensor(nodes_feature, dtype=torch.float32)
+            data_dict['nodes_feature'] = graph['nodes_feature']
             data_dict['neighbors'] = None
             data_dict['se_matrix_waiting'] = None
         elif dataset_type == 'pems08':
@@ -658,12 +564,6 @@ class LazySupervisedDataset_ST(Dataset):
             data_dict['nodes_feature'] = None
             data_dict['neighbors'] = None
             data_dict['se_matrix_waiting'] = None
-        elif dataset_type == 'SH':
-            data_dict['st_data_xd'] = None
-            data_dict['st_data_xw'] = None
-            data_dict['nodes_feature'] = None
-            data_dict['neighbors'] = torch.tensor(neighbors, dtype=torch.float32)
-            data_dict['se_matrix_waiting'] = torch.tensor(se_matrix_waiting)
         return data_dict
 
 
@@ -708,7 +608,6 @@ def make_supervised_stdata_module(tokenizer: transformers.PreTrainedTokenizer,
     train_dataset = dataset_cls(tokenizer=tokenizer,
                                 data_path_sd=data_args.data_path_sd,
                                 data_path_sz=data_args.data_path_sz,
-                                data_path_sh=data_args.data_path_sh,
                                 data_path_pems08=data_args.data_path_pems08,
                                 data_path_urbanev=data_args.data_path_urbanev,
                                 st_cfg=dict(
@@ -721,7 +620,6 @@ def make_supervised_stdata_module(tokenizer: transformers.PreTrainedTokenizer,
                                 batch_size= batch_size,
                                 st_data_path_sd=data_args.st_data_path_sd,
                                 st_data_path_sz=data_args.st_data_path_sz,
-                                st_data_path_sh=data_args.st_data_path_sh,
                                 st_data_path_pems08=data_args.st_data_path_pems08,
                                 st_data_path_urbanev=data_args.st_data_path_urbanev)
     
@@ -736,10 +634,30 @@ def train(model_args, data_args, training_args):
     print("CUDA_VISIBLE_DEVICES:", os.getenv("CUDA_VISIBLE_DEVICES"))
 
     model_args, data_args, training_args = model_args, data_args, training_args   
+    if training_args.training_stage == "llm" and not training_args.lora_enable:
+        raise ValueError("The llm stage requires --lora_enable=True")
+    if training_args.training_stage == "router" and training_args.lora_enable:
+        raise ValueError("The router stage requires --lora_enable=False")
+    if model_args.st_tower != "ST_Encoder":
+        raise ValueError("Four-dataset training requires the pretrained ST_Encoder tower")
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
     print('compute_dtype', compute_dtype)
 
     bnb_model_from_pretrained_args = {}
+    if training_args.bits in [4, 8]:
+        from transformers import BitsAndBytesConfig
+        bnb_model_from_pretrained_args.update(dict(
+            device_map={"": training_args.device},
+            quantization_config=BitsAndBytesConfig(
+                load_in_4bit=training_args.bits == 4,
+                load_in_8bit=training_args.bits == 8,
+                llm_int8_threshold=6.0,
+                llm_int8_has_fp16_weight=False,
+                bnb_4bit_compute_dtype=compute_dtype,
+                bnb_4bit_use_double_quant=training_args.double_quant,
+                bnb_4bit_quant_type=training_args.quant_type,
+            ),
+        ))
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
@@ -796,7 +714,14 @@ def train(model_args, data_args, training_args):
 
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
-    
+
+    if training_args.bits in [4, 8]:
+        from peft import prepare_model_for_kbit_training
+        model = prepare_model_for_kbit_training(
+            model,
+            use_gradient_checkpointing=training_args.gradient_checkpointing,
+        )
+
     if training_args.gradient_checkpointing and model_args.st_tower is None:
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
@@ -839,75 +764,6 @@ def train(model_args, data_args, training_args):
         data_args.is_st = True
 
         model.config.tune_st_mlp_adapter = training_args.tune_st_mlp_adapter = model_args.tune_st_mlp_adapter
-        if model_args.tune_st_mlp_adapter:
-            print('model_args.tune_st_mlp_adapter==True')
-            model.requires_grad_(False)
-        for p in model.get_model().st_projector.parameters():
-            p.requires_grad = True
-        for p in model.get_model().st_projector_sh.parameters():
-            p.requires_grad = True
-        for p in model.st_pred_linear_1.parameters():
-            p.requires_grad = True
-        for p in model.st_pred_linear_2.parameters():
-            p.requires_grad = True
-        for p in model.st_pred_linear_3.parameters():
-            p.requires_grad = True
-        for p in model.st_pred_linear_4.parameters():
-            p.requires_grad = True
-        for p in model.st_pred_linear_5.parameters():
-            p.requires_grad = True
-        for p in model.st_pred_linear_6.parameters():
-            p.requires_grad = True
-        for p in model.st_pred_linear_7.parameters():
-            p.requires_grad = True
-        for p in model.st_pred_linear_8.parameters():
-            p.requires_grad = True
-        for p in model.st_pred_linear_9.parameters():
-            p.requires_grad = True
-        for p in model.st_pred_linear_10.parameters():
-            p.requires_grad = True
-        for p in model.st_pred_linear_11.parameters():
-            p.requires_grad = True
-        for p in model.st_pred_linear_12.parameters():
-            p.requires_grad = True
-        for p in model.st_pred_linear_dispatch.parameters():
-            p.requires_grad = True
-        for p in model.lm_head.parameters():
-            p.requires_grad = True
-        if not training_args.freeze_prompt_router:
-            for p in model.prompt_router_sd.parameters():
-                p.requires_grad = True
-            for p in model.prompt_router_pems08.parameters():
-                p.requires_grad = True
-            for p in model.prompt_router_sz.parameters():
-                p.requires_grad = True
-            for p in model.prompt_router_urbanev.parameters():
-                p.requires_grad = True
-            for p in model.prompt_router_sh.parameters():
-                p.requires_grad = True
-            
-        if training_args.bits in [4, 8]:
-            from transformers import BitsAndBytesConfig
-            from peft import prepare_model_for_kbit_training
-            bnb_model_from_pretrained_args.update(dict(
-                device_map={"": training_args.device},
-                load_in_4bit=training_args.bits == 4,
-                load_in_8bit=training_args.bits == 8,
-                quantization_config=BitsAndBytesConfig(
-                    load_in_4bit=training_args.bits == 4,
-                    load_in_8bit=training_args.bits == 8,
-                    llm_int8_threshold=6.0,
-                    llm_int8_has_fp16_weight=False,
-                    bnb_4bit_compute_dtype=compute_dtype,
-                    bnb_4bit_use_double_quant=training_args.double_quant,
-                    bnb_4bit_quant_type=training_args.quant_type  # {'fp4', 'nf4'}
-                )
-            ))
-        if training_args.bits in [4, 8]:
-            print('training_args.bits in [4, 8]')
-            model.config.torch_dtype = (
-                torch.float32 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
-            model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing)
 
         model.config.freeze_st_mlp_adapter = training_args.freeze_st_mlp_adapter
         if training_args.freeze_st_mlp_adapter:
@@ -942,6 +798,9 @@ def train(model_args, data_args, training_args):
                                       device=training_args.device,
                                       tune_st_mlp_adapter=model_args.tune_st_mlp_adapter,
                                       pretrain_st_mlp_adapter=model_args.pretrain_st_mlp_adapter)
+
+        training_args.freeze_prompt_router = training_args.training_stage != "router"
+        configure_trainable_parameters(model, training_args.training_stage)
         
         params_no_grad = [n for n, p in model.named_parameters() if not p.requires_grad]
         
@@ -995,10 +854,7 @@ def train(model_args, data_args, training_args):
             tuned_params.append(name)
     print(tuned_params)
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
-    else:
-        trainer.train()
+    trainer.train(resume_from_checkpoint=training_args.resume_checkpoint)
     trainer.save_state()
 
     if training_args.lora_enable:

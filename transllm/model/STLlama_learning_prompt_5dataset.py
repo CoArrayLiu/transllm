@@ -436,8 +436,6 @@ class MultiSlotActorCriticRouter(nn.Module):
             ) for _ in range(num_slots)
         ])
 
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
-
         # Each slot individually records log_prob / value / reward
         self.saved_log_probs = [[] for _ in range(num_slots)]
         self.saved_values = [[] for _ in range(num_slots)]
@@ -451,7 +449,7 @@ class MultiSlotActorCriticRouter(nn.Module):
             probs_per_slot.append(probs)
         return probs_per_slot  # List of [B, num_prompts]
 
-    def select_prompts(self, embedding):
+    def select_prompts(self, embedding, track_episode=True, deterministic=False):
         selected = []    
         embedding = embedding.detach()
         for slot in range(self.num_slots):
@@ -461,14 +459,11 @@ class MultiSlotActorCriticRouter(nn.Module):
             logits = logits.to(torch.float32)   # [B, num_prompts]
             probs = F.softmax(logits, dim=-1)
             dist = torch.distributions.Categorical(probs)
-            action = dist.sample()  # [B]
-            log_prob = dist.log_prob(action)  # [B]
-
-            value = critic(embedding).squeeze(-1)  # [B]
+            action = probs.argmax(dim=-1) if deterministic else dist.sample()
             selected.append(action)
-
-            self.saved_log_probs[slot].append(log_prob)
-            self.saved_values[slot].append(value)
+            if track_episode:
+                self.saved_log_probs[slot].append(dist.log_prob(action))
+                self.saved_values[slot].append(critic(embedding).squeeze(-1))
         return torch.stack(selected, dim=1)  # [B, num_slots]
 
     def store_reward(self, rewards_per_slot: list):
@@ -480,7 +475,7 @@ class MultiSlotActorCriticRouter(nn.Module):
 
     def finish_episode(self):
         if self.saved_log_probs[0] == []:
-            return
+            return None
         total_loss = None
         for slot in range(self.num_slots):
             if len(self.rewards[slot]) == 0:
@@ -507,13 +502,10 @@ class MultiSlotActorCriticRouter(nn.Module):
             else:
                 total_loss = total_loss + loss
 
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        self.optimizer.step()
-
         self.saved_log_probs = [[] for _ in range(self.num_slots)]
         self.saved_values = [[] for _ in range(self.num_slots)]
         self.rewards = [[] for _ in range(self.num_slots)]
+        return total_loss
 
 
 
@@ -564,6 +556,7 @@ class STLlamaForCausalLM(LlamaForCausalLM):
         self.st_pre_res = []
         self.batch_num = 0
         self.current_dataset=None
+        self.training_stage = "llm"
         
         # Initialize weights and apply final processing
         self.post_init()
@@ -736,6 +729,40 @@ class STLlamaForCausalLM(LlamaForCausalLM):
         prompt_parts = [slots[i][routing_info[i]] for i in range(4)]
         new_sentence = " ".join(prompt_parts)
         return new_sentence
+
+    def replace_prompt_urbanev(self, routing_info: torch.Tensor, original_sentence: str,
+                               st_data_xh_tmp, st_data_xd_tmp, st_data_xw_tmp) -> str:
+        _, _, future_time = self.extract_info(original_sentence=original_sentence)
+        st_data_xh = st_data_xh_tmp[:, 0, 0].int()
+        st_data_xd = st_data_xd_tmp[:, 0, 0].int()
+        st_data_xw = st_data_xw_tmp[:, 0, 0].int()
+        slots = [
+            [
+                f"Using charging demand from the previous 12 hours {st_data_xh.tolist()}, we examine recent hourly changes.",
+                f"We compare the previous 12 hours {st_data_xh.tolist()} with the same hours yesterday {st_data_xd.tolist()} to capture daily charging patterns.",
+                f"We compare the previous 12 hours {st_data_xh.tolist()} with the same hours last week {st_data_xw.tolist()} to capture weekly charging patterns.",
+                f"We jointly analyze the previous 12 hours {st_data_xh.tolist()}, yesterday {st_data_xd.tolist()}, and last week {st_data_xw.tolist()} to model short- and long-term charging demand.",
+            ],
+            [
+                f"The task is to forecast charging demand for the next 12 hours starting from {future_time}, with one-hour intervals.",
+                f"Based on these hourly observations, predict 12 future hourly charging-demand values beginning at {future_time}.",
+                f"Use the hourly temporal context to estimate charging demand from {future_time} through the following 12 hours.",
+                f"The forecast begins at {future_time} and covers the next 12 one-hour intervals.",
+            ],
+            [
+                "A pretrained spatio-temporal encoder represents the 12-hour forecasting context as <ST_EMB>.",
+                "Twelve spatio-temporal embeddings encode the hourly context for the prediction horizon: <ST_EMB>.",
+                "The encoder provides one context token for each of the 12 future hourly intervals: <ST_EMB>.",
+                "The complete 12-hour spatio-temporal context is represented by <ST_EMB>.",
+            ],
+            [
+                "Reason over temporal rhythms and spatial correlations, then provide the 12-hour charging-demand forecast using <ST_PRE>.",
+                "Analyze recent hourly trends and generate the next 12 hourly values using <ST_PRE>.",
+                "Use typical EV charging cycles to guide the prediction and return the 12-hour forecast through <ST_PRE>.",
+                "Consider recurring patterns and unexpected shifts, then produce the 12-step hourly forecast using <ST_PRE>.",
+            ],
+        ]
+        return " ".join(slots[index][routing_info[index]] for index in range(4))
     
     def replace_prompt_sh(self, routing_info: torch.Tensor, original_sentence: str, st_data_xh_tmp) -> str:
         empty_counts, current_time, dispatch_time = self.extract_info_sh(sentence=original_sentence)
@@ -859,22 +886,15 @@ class STLlamaForCausalLM(LlamaForCausalLM):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         device = next(self.parameters()).device
         data_type =0
-        if sources != None:
-            if sources[0][0]["id"].split('_')[1]=='SD':
-                dataset='SD'
-                data_type=1
-            elif sources[0][0]["id"].split('_')[1]=='SZ':
-                dataset='SZ'
-                data_type =2
-            elif sources[0][0]["id"].split('_')[1]=='SH':
-                dataset='SH'
-                data_type =3
-            elif sources[0][0]["id"].split('_')[1]=='urbanev':
-                dataset='urbanev'
-                data_type =5
-            elif sources[0][0]["id"].split('_')[1]=='pems08':
-                dataset='pems08'
-                data_type =6
+        if sources is not None:
+            batch_datasets = {item[0]["id"].split('_')[1] for item in sources}
+            if len(batch_datasets) != 1:
+                raise ValueError(f"A batch must contain exactly one dataset, got {sorted(batch_datasets)}")
+            dataset = batch_datasets.pop()
+            dataset_types = {"SD": 1, "SZ": 2, "urbanev": 5, "pems08": 6}
+            if dataset not in dataset_types:
+                raise ValueError(f"Unsupported dataset in four-dataset training: {dataset}")
+            data_type = dataset_types[dataset]
         if input_ids == None:
             input_ids_batch = []
             labels_batch = []
@@ -919,19 +939,16 @@ class STLlamaForCausalLM(LlamaForCausalLM):
             patchlist=[]
             empty_counts = []
             if dataset =='SD':
-                routing_info_sd = self.prompt_router_sd.select_prompts(region_select_out)
+                routing_info_sd = self.prompt_router_sd.select_prompts(region_select_out, track_episode=self.training_stage == "router", deterministic=not self.training)
                 self.current_dataset = 'SD'
             elif dataset =='SZ':
-                routing_info_sz = self.prompt_router_sz.select_prompts(region_select_out)
+                routing_info_sz = self.prompt_router_sz.select_prompts(region_select_out, track_episode=self.training_stage == "router", deterministic=not self.training)
                 self.current_dataset = 'SZ'
-            elif dataset =='SH':
-                routing_info_sh = self.prompt_router_sh.select_prompts(region_select_out)
-                self.current_dataset = 'SH'
             elif dataset =='pems08':
-                routing_info_pems08 = self.prompt_router_pems08.select_prompts(region_select_out)
+                routing_info_pems08 = self.prompt_router_pems08.select_prompts(region_select_out, track_episode=self.training_stage == "router", deterministic=not self.training)
                 self.current_dataset = 'pems08'
             elif dataset =='urbanev':
-                routing_info_urbanev = self.prompt_router_urbanev.select_prompts(region_select_out)
+                routing_info_urbanev = self.prompt_router_urbanev.select_prompts(region_select_out, track_episode=self.training_stage == "router", deterministic=not self.training)
                 self.current_dataset = 'urbanev'
             for i in range(len(sources)):  
                 if dataset=='SD':         
@@ -951,15 +968,6 @@ class STLlamaForCausalLM(LlamaForCausalLM):
                     )
                     cur_token_len = 12
                     output_token_len = 12
-                elif dataset=='SH':
-                    sources[i][0]["conversations"][0]['value'],empty_count = self.replace_prompt_sh(
-                        routing_info_sh[i],
-                        sources[i][0]["conversations"][0]['value'],
-                        st_data_xh_tmp[i]
-                    )
-                    cur_token_len = 9
-                    output_token_len = 9
-                    empty_counts.append(torch.tensor(empty_count,device=device))
                 elif dataset=='pems08':
                     sources[i][0]["conversations"][0]['value'] = self.replace_prompt_sd(
                         routing_info_pems08[i],
@@ -969,7 +977,7 @@ class STLlamaForCausalLM(LlamaForCausalLM):
                     cur_token_len = 12
                     output_token_len = 12
                 elif dataset=='urbanev':
-                    sources[i][0]["conversations"][0]['value'] = self.replace_prompt_sz(
+                    sources[i][0]["conversations"][0]['value'] = self.replace_prompt_urbanev(
                         routing_info_urbanev[i],
                         sources[i][0]["conversations"][0]['value'],
                         st_data_xh_tmp[i],st_data_xd_tmp[i],st_data_xw_tmp[i]
@@ -1149,7 +1157,7 @@ class STLlamaForCausalLM(LlamaForCausalLM):
                     loss_regress_scaling_factor = 1.0
                     loss_regress = loss_regress*loss_regress_scaling_factor
                 loss = loss_fct(shift_logits, shift_labels) + loss_regress
-            else:
+            elif dataset == 'SH':
                 # ==== RL：dispatch reward ====
                 real_prob_list=[]
                 for i in range(batch_size):                    
@@ -1187,21 +1195,24 @@ class STLlamaForCausalLM(LlamaForCausalLM):
                 loss_per_sample = -reward_per_grid.mean(dim=1)
                 loss = loss_fct(shift_logits, shift_labels) + loss1*100 + wasserstein_distance.mean() *0.05
                 print(f"Reward mean: {reward_per_grid.mean().item():.4f}, Reward std: {reward_per_grid.std().item():.4f}, Advantage std: {advantage.std().item():.4f}, Reinforce Loss: {loss1.item():.6f}, Wasserstein: {wasserstein_distance.mean().item():.6f}", flush=True)
+            else:
+                raise ValueError(f"Unsupported dataset for loss calculation: {dataset}")
 
             reward_slot = -loss_per_sample.detach() 
 
             rewards_per_slot = [reward_slot.clone() for _ in range(self.prompt_router_sd.num_slots)]
 
-            if dataset == 'SD':
-                self.prompt_router_sd.store_reward(rewards_per_slot)
-            elif dataset == 'SZ':
-                self.prompt_router_sz.store_reward(rewards_per_slot)
-            elif dataset == 'SH':
-                self.prompt_router_sh.store_reward(rewards_per_slot)
-            elif dataset == 'pems08':
-                self.prompt_router_pems08.store_reward(rewards_per_slot)
-            elif dataset == 'urbanev':
-                self.prompt_router_urbanev.store_reward(rewards_per_slot)
+            if self.training_stage == "router":
+                router = {
+                    "SD": self.prompt_router_sd,
+                    "SZ": self.prompt_router_sz,
+                    "pems08": self.prompt_router_pems08,
+                    "urbanev": self.prompt_router_urbanev,
+                }[dataset]
+                router.store_reward(rewards_per_slot)
+                router_loss = router.finish_episode()
+                if router_loss is not None:
+                    loss = loss + router_loss
 
             print(loss_fct(shift_logits, shift_labels)) 
 
@@ -1252,7 +1263,8 @@ class STLlamaForCausalLM(LlamaForCausalLM):
                 "se_matrix": [kwargs.get("se_matrix", None)],
                 "se_matrix_waiting": [kwargs.get("se_matrix_waiting", None)],
                 "patchlist": [kwargs.get("patchlist", None)],
-                "neighbors": [kwargs.get("neighbors", None)]
+                "neighbors": [kwargs.get("neighbors", None)],
+                "data_type": kwargs.get("data_type", 0),
             }
         )
         return model_inputs

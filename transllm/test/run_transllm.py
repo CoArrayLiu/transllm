@@ -240,13 +240,11 @@ def eval_model(args, prompt_file, start_idx, end_idx):
     model = STLlamaForCausalLM.from_pretrained(args.model_name, num_prompts=4, num_slots=4,torch_dtype=torch.bfloat16, use_cache=True,device_map=None,
                                                   low_cpu_mem_usage=False).to("cuda")
     model.set_st_tower()
+    model.eval()
     print('finish loading')
     args1 = get_config()
     args1.bs = 1
-    nodes_feature1,sp_matrix1,se_matrix1,\
-            nodes_feature2,sp_matrix2,se_matrix2,\
-                sp_matrix3,se_matrix3,se_matrix4,nodes_feature5,\
-                    sp_matrix5,se_matrix5,sp_matrix6,se_matrix6=load_adj(args1)
+    graphs = load_adj(args1)
    
     use_st_start_end = getattr(model.config, "use_st_start_end", True)
     tokenizer.add_tokens([DEFAULT_ST_PATCH_TOKEN], special_tokens=True)
@@ -299,37 +297,43 @@ def eval_model(args, prompt_file, start_idx, end_idx):
         dataset = instruct_item["id"].split('_')[1]
         st_data_x_copy = copy.deepcopy(st_data_x).cuda()
         if dataset == "SD":
-            node_feature = nodes_feature1.cuda()
-            sp_matrix = sp_matrix1.cuda()
-            se_matrix = se_matrix1.cuda()
+            graph = graphs[dataset]
+            node_feature = graph["nodes_feature"].cuda()
+            sp_matrix = graph["sp_matrix"].cuda()
+            se_matrix = graph["se_matrix"].cuda()
             _, node_embedding = model.model.st_tower(st_data_x_copy[..., :3],sp_matrix,se_matrix,1,node_feature)
             selected = node_embedding[:, :, region_start:region_end, :]
-            routing_info = model.prompt_router_sd.select_prompts(selected.reshape(selected.shape[0],-1).to(torch.bfloat16)).squeeze(0)
+            routing_info = model.prompt_router_sd.select_prompts(selected.reshape(selected.shape[0],-1).to(torch.bfloat16), track_episode=False, deterministic=True).squeeze(0)
             qs = replace_prompt_sd(routing_info,original_sentence,st_data_xh_tmp,st_data_xd_tmp,st_data_xw_tmp)
         elif dataset == "SZ":
-            node_feature = nodes_feature2.cuda()
-            sp_matrix = sp_matrix2.cuda()
-            se_matrix = se_matrix2.cuda()
+            graph = graphs[dataset]
+            node_feature = graph["nodes_feature"].cuda()
+            sp_matrix = graph["sp_matrix"].cuda()
+            se_matrix = graph["se_matrix"].cuda()
             _, node_embedding = model.model.st_tower(st_data_x_copy[..., :3],sp_matrix,se_matrix,2,node_feature)
             selected = node_embedding[:, :, region_start:region_end, :]
-            routing_info = model.prompt_router_sz.select_prompts(selected.reshape(selected.shape[0],-1).to(torch.bfloat16)).squeeze(0)
+            routing_info = model.prompt_router_sz.select_prompts(selected.reshape(selected.shape[0],-1).to(torch.bfloat16), track_episode=False, deterministic=True).squeeze(0)
             qs = replace_prompt_sz(routing_info,original_sentence,st_data_xh_tmp,st_data_xd_tmp,st_data_xw_tmp)
         elif dataset == "pems08":
+            graph = graphs[dataset]
             node_feature = None
-            sp_matrix = sp_matrix6.cuda()
-            se_matrix = se_matrix6.cuda()
+            sp_matrix = graph["sp_matrix"].cuda()
+            se_matrix = graph["se_matrix"].cuda()
             _, node_embedding = model.model.st_tower(st_data_x_copy[..., :3],sp_matrix,se_matrix,6,node_feature)
             selected = node_embedding[:, :, region_start:region_end, :]
-            routing_info = model.prompt_router_pems08.select_prompts(selected.reshape(selected.shape[0],-1).to(torch.bfloat16)).squeeze(0)
+            routing_info = model.prompt_router_pems08.select_prompts(selected.reshape(selected.shape[0],-1).to(torch.bfloat16), track_episode=False, deterministic=True).squeeze(0)
             qs = replace_prompt_sd(routing_info,original_sentence,st_data_xh_tmp,st_data_xd_tmp,st_data_xw_tmp)
         elif dataset == "urbanev":
-            node_feature = nodes_feature5.cuda()
-            sp_matrix = sp_matrix5.cuda()
-            se_matrix = se_matrix5.cuda()
+            graph = graphs[dataset]
+            node_feature = graph["nodes_feature"].cuda()
+            sp_matrix = graph["sp_matrix"].cuda()
+            se_matrix = graph["se_matrix"].cuda()
             _, node_embedding = model.model.st_tower(st_data_x_copy[..., :3],sp_matrix,se_matrix,5,node_feature)
             selected = node_embedding[:, :, region_start:region_end, :]
-            routing_info = model.prompt_router_urbanev.select_prompts(selected.reshape(selected.shape[0],-1).to(torch.bfloat16)).squeeze(0)
-            qs = replace_prompt_sz(routing_info,original_sentence,st_data_xh_tmp,st_data_xd_tmp,st_data_xw_tmp)
+            routing_info = model.prompt_router_urbanev.select_prompts(selected.reshape(selected.shape[0],-1).to(torch.bfloat16), track_episode=False, deterministic=True).squeeze(0)
+            qs = model.replace_prompt_urbanev(routing_info,original_sentence,st_data_xh_tmp,st_data_xd_tmp,st_data_xw_tmp)
+        else:
+            raise ValueError(f"Unsupported evaluation dataset: {dataset}")
 
         patchlist = []
         cur_token_len = 12
@@ -367,7 +371,7 @@ def eval_model(args, prompt_file, start_idx, end_idx):
         keywords = [stop_str]
         stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
 
-        attention_mask = (input_ids != 128256).long()
+        attention_mask = (input_ids != tokenizer.pad_token_id).long()
 
 
         with torch.inference_mode():
@@ -377,14 +381,14 @@ def eval_model(args, prompt_file, start_idx, end_idx):
                 st_data_y=st_data_y.cuda(),
                 region_start=region_start,
                 region_end=region_end,
-                do_sample=True,
+                do_sample=False,
                 attention_mask = attention_mask,
-                pad_token_id=128256,
-                temperature=0.01,
+                pad_token_id=tokenizer.pad_token_id,
                 max_new_tokens=256,
                 nodes_feature = node_feature,
                 sp_matrix = sp_matrix,
                 se_matrix = se_matrix,
+                data_type = graph["st_encoder_type"],
                 patchlist=patchlist,
                 mean = [mean],
                 std = [std],
@@ -393,8 +397,8 @@ def eval_model(args, prompt_file, start_idx, end_idx):
                 stopping_criteria=[stopping_criteria])
 
             # Find the special tokens
-            start_inx = torch.where(output_ids[0, :] == 128258)[0]
-            end_inx = torch.where(output_ids[0, :] == 128259)[0]
+            start_inx = torch.where(output_ids[0, :] == st_config.st_start_token)[0]
+            end_inx = torch.where(output_ids[0, :] == st_config.st_end_token)[0]
             # Get hidden_states
             hidden_states = model.get_st_pre_res()
             hidden_states = torch.cat(hidden_states, dim=1)
@@ -408,15 +412,22 @@ def eval_model(args, prompt_file, start_idx, end_idx):
                 st_pre_embs1 = hidden_states[:,
                             start_inx[0]+1:end_inx[0],
                             :].detach().reshape(batch_size, -1, feature_nums, model.config.hidden_size)
-                st_pre_out1 = model.relu(model.st_pred_linear_1(st_pre_embs1))
+                head_mapping = {
+                    "SD": (model.st_pred_linear_1, model.st_pred_linear_3, model.st_pred_linear_2),
+                    "SZ": (model.st_pred_linear_4, model.st_pred_linear_6, model.st_pred_linear_5),
+                    "pems08": (model.st_pred_linear_7, model.st_pred_linear_9, model.st_pred_linear_8),
+                    "urbanev": (model.st_pred_linear_10, model.st_pred_linear_12, model.st_pred_linear_11),
+                }
+                history_head, future_head, output_head = head_mapping[dataset]
+                st_pre_out1 = model.relu(history_head(st_pre_embs1))
 
 
                 st_pre_embs2 = hidden_states[:,
                             start_inx[2]+1:end_inx[2],
                             :].reshape(batch_size, -1, feature_nums, model.config.hidden_size)
-                st_pre_out2 = model.relu(model.st_pred_linear_3(st_pre_embs2))
+                st_pre_out2 = model.relu(future_head(st_pre_embs2))
 
-                st_pre_final = model.st_pred_linear_2(torch.cat([st_pre_out1, st_pre_out2], dim=-1)).reshape(st_pre_out1.shape[0],12,1,1)
+                st_pre_final = output_head(torch.cat([st_pre_out1, st_pre_out2], dim=-1)).reshape(st_pre_out1.shape[0],12,1,1)
                 st_pre_infolow = st_pre_final[:, :, :, 0].squeeze().detach().cpu().tolist()
 
 
@@ -452,7 +463,7 @@ if __name__ == "__main__":
     st_data_path='./data/prompt_data/pems08_test_pkl.pkl'
     res_path='./result_test/pems08'
     start_id=0
-    end_id=170*12
+    end_id=None
     num_gpus=1
 
     parser = argparse.ArgumentParser()
@@ -469,4 +480,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    if args.end_id is None:
+        args.end_id = len(load_prompting_file(args.prompting_file))
     run_eval(args, args.num_gpus)

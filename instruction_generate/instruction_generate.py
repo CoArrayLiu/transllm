@@ -199,11 +199,12 @@ for i in range(train_len):
 
     # time_of_day = data[..., 2:3]/288
     # day_of_week = (data[..., 3:4]-1)/7
-    time_of_day = data[..., 2:3]/24
+    time_slots_per_day = 24 * (60 // args.interval)
+    time_of_day = data[..., 2:3] / time_slots_per_day
     day_of_week = (data[..., 3:4]-1)/7
-    time_of_day_1d = data_1d[..., 2:3]/24
+    time_of_day_1d = data_1d[..., 2:3] / time_slots_per_day
     day_of_week_1d = (data_1d[..., 3:4]-1)/7
-    time_of_day_1w = data_1w[..., 2:3]/24
+    time_of_day_1w = data_1w[..., 2:3] / time_slots_per_day
     day_of_week_1w = (data_1w[..., 3:4]-1)/7
     dict_data["data_x"], dict_data["data_y"] = np.concatenate([data_nor[..., :args.input_base_dim],time_of_day,day_of_week, data[..., -1:]], axis=-1), \
                                                np.concatenate([label[..., :args.input_base_dim], label[..., -1:]], axis=-1)
@@ -282,7 +283,7 @@ for i in range(train_len):
                     "predictive tokens for regression in the form \"<ST_PRE>\"."
             value_of_gpt = "Based on the given historical traffic flow data, time encoding, and spatio-temporal embeddings, the " \
                         "predictive tokens for the traffic flow in this region are <ST_PRE>."
-        elif type ==8 or type ==11.0:
+        elif type == 8:
             value_of_human = "Given the historical data for charging demand over 12 time steps in a grid of Shenzhen, " \
                     "the recorded charging demand values are " + str_flow + \
                     ". The recording time of the historical data is " + time_decode(data_gpt, args, type) + \
@@ -294,6 +295,18 @@ for i in range(train_len):
                     "predictive tokens for regression in the form \"<ST_PRE>\"."
             value_of_gpt = "Based on the given charging demand data, time encoding, and spatio-temporal embeddings, the " \
                         "predictive tokens for the charging demand in this region are <ST_PRE>."
+        elif type == 11:
+            value_of_human = "Given the historical charging demand over the previous 12 hours in an urban EV charging grid, " \
+                    "the recorded hourly charging demand values are " + str_flow + \
+                    ". The recording time of the historical data is " + time_decode(data_gpt, args, type) + \
+                    ". A spatio-temporal convolution model encodes the historical data as <ST_EMB>. " \
+                    "Now predict charging demand for the next 12 hours at one-hour intervals during " + \
+                    time_decode(label_gpt, args, type) + ". Analyze the hourly charging patterns and generate " \
+                    "the predictive regression tokens in the form \"<ST_PRE>\"."
+            value_of_gpt = "Based on the hourly charging demand, time encoding, and spatio-temporal embeddings, the " \
+                        "predictive tokens for the next 12 hours are <ST_PRE>."
+        else:
+            raise ValueError(f"Unsupported dataset type for instruction generation: {type}")
         dict_main["id"] = 'train_' + args.dataset_name + '_region_' + str(region_start) + '_' + str(region_end) + '_len_' + str(i)
         dict_conversation_human["from"], dict_conversation_human["value"] = "human", value_of_human
         dict_conversation_gpt["from"], dict_conversation_gpt["value"] = "gpt", value_of_gpt

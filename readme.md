@@ -204,16 +204,46 @@ python pretrain_Enc.py
 - First stage: fine-tune the LLM; freeze the Prompt Router.
 
 ```shell
-python train_learning_prompt_5dataset.py --lora_enable True \
-                                         --freeze_prompt_router True
+python train_learning_prompt_5dataset.py --training_stage llm
 ```
 
 - Second stage: freeze the LLM; fine-tune the Prompt Router.
 
 ```shell
-python train_learning_prompt_5dataset.py --lora_enable False \
-                                         --freeze_prompt_router False
+python train_learning_prompt_5dataset.py --training_stage router
 ```
+
+#### Four-dataset training without SH
+
+This checkout supports training on `SD_2021`, `SZ_2022`, `pems08`, and
+`urbanev` without reading any SH data. The original pretrained ST-Encoder is
+kept, including its task ids (`SD=1`, `SZ=2`, `urbanev=5`, `pems08=6`).
+
+Generate and validate the four datasets first:
+
+```shell
+./scripts/generate_cache_matrices.sh
+./scripts/generate_prompt_data.sh
+python scripts/validate_four_dataset_setup.py
+```
+
+Run the two stages in separate output directories. The second command loads
+only the first-stage model weights and starts a fresh optimizer/scheduler:
+
+```shell
+./scripts/train_four_datasets.sh llm
+./scripts/train_four_datasets.sh router
+```
+
+Use `--resume_checkpoint` only for recovery within the same stage, for example:
+
+```shell
+./scripts/train_four_datasets.sh llm \
+  --resume_checkpoint checkpoints/transllm_4dataset/stage1_llm/checkpoint-4800
+```
+
+The four-dataset path does not use `instruction_generate_dispatch.py`,
+`run_transllm_dispatch.py`, or `result_test_dispatch.py`.
 
 <a id='transllm-evaluating'></a>
 

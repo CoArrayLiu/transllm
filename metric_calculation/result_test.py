@@ -3,20 +3,12 @@ from metrics import All_Metrics
 import json
 import numpy as np
 import os
+import argparse
+from collections import OrderedDict
 from sklearn.metrics import f1_score, recall_score, precision_score, accuracy_score, classification_report
 
-def test(mode, mae_thresh=None, mape_thresh=0.0):
-    len_nums = 0
-    y_pred_in = []
-    y_true_in = []
-    y_pred_out = []
-    y_true_out = []
-
-    y_true_in_regionlist = []
-    y_pred_in_regionlist = []
-    y_true_out_regionlist = []
-    y_pred_out_regionlist = []
-    index_all = 0
+def test(folder_path, mode="regression", mae_thresh=None, mape_thresh=0.0):
+    grouped = OrderedDict()
 
     # Retrieve all JSON files from a folder and sort them by filename
     file_list = sorted([filename for filename in os.listdir(folder_path) if filename.endswith(".json")])
@@ -29,35 +21,16 @@ def test(mode, mae_thresh=None, mape_thresh=0.0):
 
         for i in range(len(data_t)):
             i_data = data_t[i]
-            y_in = np.array(i_data["y_in"])     
-            st_pre_infolow = np.array(i_data["st_pre_infolow"])
-            i4data_all = int(data_t[i]["id"].split('_')[7])
-            if index_all != i4data_all :
-                len_nums = len_nums + 1
-                y_true_in_region = np.stack(y_true_in, axis=-1)
-                y_pred_in_region = np.stack(y_pred_in, axis=-1)
+            sample_index = int(i_data["id"].rsplit('_', 1)[-1])
+            group = grouped.setdefault(sample_index, {"true": [], "pred": []})
+            group["true"].append(np.array(i_data["y_in"]))
+            group["pred"].append(np.array(i_data["st_pre_infolow"]))
 
-                y_true_in_regionlist.append(y_true_in_region)
-                y_pred_in_regionlist.append(y_pred_in_region)
-
-                y_pred_in = []
-                y_true_in = []
-
-                index_all = i4data_all
-            y_true_in.append(y_in)
-            y_pred_in.append(st_pre_infolow)
-
-            if (i == len(data_t) - 1 and idx == len(file_list) - 1):
-                y_true_in_region = np.stack(y_true_in, axis=-1)
-                y_pred_in_region = np.stack(y_pred_in, axis=-1)
-
-                y_true_in_regionlist.append(y_true_in_region)
-                y_pred_in_regionlist.append(y_pred_in_region)
-
-                y_pred_in = []
-                y_true_in = []
-
-    print('len_nums', len_nums)
+    if not grouped:
+        raise ValueError(f"No result samples found in {folder_path}")
+    y_true_in_regionlist = [np.stack(group["true"], axis=-1) for group in grouped.values()]
+    y_pred_in_regionlist = [np.stack(group["pred"], axis=-1) for group in grouped.values()]
+    print('sample_windows', len(grouped))
     y_true_in = np.expand_dims(np.concatenate(y_true_in_regionlist, axis=-1),axis=0)
     y_pred_in = np.expand_dims(np.concatenate(y_pred_in_regionlist, axis=-1),axis=0)
     # y_true_in = np.stack(y_true_in_regionlist, axis=0)
@@ -102,9 +75,13 @@ def test_classfication(y_true_in, y_pred_in):
         print(f"MacroF1: {macro_f1:.2f}")
         print(f"f1 Score: {f1:.2f}")
 
-################################ result path ################################
-folder_path = './result_test1/SD_2021_test_wd_3dataset_llama_noEnc'
-
-mode = 'regression'
-
-test(mode)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--folder_path", required=True)
+    parser.add_argument("--dataset", choices=("SD", "SZ", "pems08", "urbanev"), required=True)
+    parser.add_argument("--mode", choices=("regression", "classification"), default="regression")
+    parser.add_argument("--mae_thresh", type=float, default=None)
+    parser.add_argument("--mape_thresh", type=float, default=0.0)
+    args = parser.parse_args()
+    print(f"Evaluating {args.dataset} from {args.folder_path}")
+    test(args.folder_path, args.mode, args.mae_thresh, args.mape_thresh)

@@ -31,21 +31,6 @@ class STChatTrainer(Trainer):
             num_workers=self.args.dataloader_num_workers,
             pin_memory=self.args.dataloader_pin_memory,
         )
-    def training_step(self, model, inputs):
-        loss = super().training_step(model, inputs)
-
-        if not self.args.freeze_prompt_router:
-            if model.current_dataset == 'SD':
-                model.prompt_router_sd.finish_episode()
-            elif model.current_dataset == 'pems08':
-                model.prompt_router_pems08.finish_episode()
-            elif model.current_dataset == 'SZ':
-                model.prompt_router_sz.finish_episode()
-            elif model.current_dataset == 'urbanev':
-                model.prompt_router_urbanev.finish_episode()
-            elif model.current_dataset == 'SH':
-                model.prompt_router_sh.finish_episode()
-        return loss
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, 'tune_st_mlp_adapter', False):
             _state_dict = state_dict
@@ -78,4 +63,3 @@ class STChatTrainer(Trainer):
 
         super(STChatTrainer, self)._save(output_dir, state_dict)
 
-    

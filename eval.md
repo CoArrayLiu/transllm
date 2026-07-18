@@ -41,14 +41,14 @@ r 35000  pems08   mae 12.15  RMSE 16.03  MAPE 35%
 r 40000  pems08   mae 11.71  RMSE 15.04  MAPE 44%
 r 40000  pems08   mae 10.55  RMSE 13.97  MAPE 38%
 r 50000 Average Horizon, MAE: 10.22, RMSE: 13.65, MAPE: 27.4503%
-r 80000 Average Horizon, MAE: 8.75, RMSE: 11.99, MAPE: 19.1478%
+r 70000 Average Horizon, MAE: 8.75, RMSE: 11.99, MAPE: 19.1478%s
 
 CUDA_VISIBLE_DEVICES=0 python -m transllm.test.run_transllm \
-  --checkpoint ./checkpoints/transllm_4dataset/stage1_llm/checkpoint-70000 \
+  --checkpoint ./checkpoints/transllm_4dataset/stage1_llm/checkpoint-65000 \
   --base-model ./checkpoints/llama3-8b \
   --prompting_file ./data/prompt_data/pems08_test.json \
   --st_data_path ./data/prompt_data/pems08_test_pkl.pkl \
-  --output_res_path ./result_checkpoint/checkpoint-70000/pems08_12windows \
+  --output_res_path ./result_checkpoint/checkpoint-65000/pems08_12windows \
   --start_id 0 \
   --num-samples 340 \
   --max_new_tokens 256 \
@@ -56,7 +56,7 @@ CUDA_VISIBLE_DEVICES=0 python -m transllm.test.run_transllm \
 
 
 python -m metric_calculation.result_test \
-  --folder_path ./result_checkpoint/checkpoint-70000/pems08_12windows \
+  --folder_path ./result_checkpoint/checkpoint-65000/pems08_12windows \
   --dataset pems08
 
 

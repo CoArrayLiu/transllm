@@ -133,7 +133,7 @@ CUDA_VISIBLE_DEVICES=0 python -m transllm.train.train_learning_prompt_5dataset \
   --training_stage llm \
   --model_name_or_path ./checkpoints/llama3-8b \
   --output_dir ./checkpoints/transllm_4dataset/stage1_llm \
-  --resume_checkpoint ./checkpoints/transllm_4dataset/stage1_llm/checkpoint-50000 \
+  --resume_checkpoint ./checkpoints/transllm_4dataset/stage1_llm/checkpoint-70000 \
   --num_train_epochs 1 \
   --per_device_train_batch_size 12 \
   --gradient_accumulation_steps 1 \

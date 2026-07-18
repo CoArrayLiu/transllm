@@ -21,6 +21,60 @@ def unwrap_model(model: nn.Module) -> nn.Module:
 
 from torch.utils.data import DataLoader
 class STChatTrainer(Trainer):
+    loss_component_names = (
+        "language_loss",
+        "regression_loss",
+        "normalized_regression_loss",
+    )
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        loss, outputs = super().compute_loss(
+            model,
+            inputs,
+            return_outputs=True,
+            **kwargs,
+        )
+
+        sources = inputs.get("sources")
+        dataset = None
+        if sources:
+            try:
+                dataset = sources[0][0]["id"].split("_")[1]
+            except (IndexError, KeyError, TypeError):
+                dataset = None
+
+        if dataset is not None and hasattr(outputs, "get"):
+            totals = getattr(self, "_loss_component_totals", None)
+            counts = getattr(self, "_loss_component_counts", None)
+            if totals is None or counts is None:
+                totals = self._loss_component_totals = {}
+                counts = self._loss_component_counts = {}
+            for name in self.loss_component_names:
+                value = outputs.get(name)
+                if value is None:
+                    continue
+                key = (dataset, name)
+                totals[key] = totals.get(key, 0.0) + float(
+                    value.detach().float().item()
+                )
+                counts[key] = counts.get(key, 0) + 1
+
+        return (loss, outputs) if return_outputs else loss
+
+    def log(self, logs, *args, **kwargs):
+        # Add averages to the Trainer's normal logging event rather than
+        # emitting one record for every gradient-accumulation micro-batch.
+        totals = getattr(self, "_loss_component_totals", {})
+        counts = getattr(self, "_loss_component_counts", {})
+        if "loss" in logs and totals:
+            logs = dict(logs)
+            for (dataset, name), total in sorted(totals.items()):
+                count = counts[(dataset, name)]
+                logs[f"{name}/{dataset}"] = round(total / count, 6)
+            totals.clear()
+            counts.clear()
+        return super().log(logs, *args, **kwargs)
+
     def get_train_dataloader(self):
         dataloader_kwargs = dict(
             dataset=self.train_dataset,

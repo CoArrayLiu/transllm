@@ -73,31 +73,14 @@ def find_first_patch_run(token_ids, patch_token_id, patch_count=12):
     return None
 
 
-def parse_st_id(instruction_id):
-    """Extract region bounds and the cached sample index from a prompt ID."""
-    match = re.fullmatch(
-        r"train_(?P<dataset>.+)_region_(?P<region_start>\d+)_"
-        r"(?P<region_end>\d+)_len_(?P<sample_index>\d+)",
-        instruction_id,
-    )
-    if match is None:
-        raise ValueError(
-            f"Invalid instruction id {instruction_id!r}; expected "
-            "'train_<dataset>_region_<start>_<end>_len_<sample_index>'"
-        )
-    return (
-        int(match.group("region_start")),
-        int(match.group("region_end")),
-        int(match.group("sample_index")),
-    )
-
-
 
 def load_st(idx, instruct_item, st_data_all):
 
     sources = instruct_item
 
-    region_start, region_end, i4data_all = parse_st_id(sources["id"])
+    region_start = int(sources["id"].split('_')[3])
+    region_end = int(sources["id"].split('_')[4])
+    i4data_all = int(sources["id"].split('_')[6])
 
     st_data_x = torch.Tensor(st_data_all[i4data_all]['data_x'])
     st_data_xd = torch.Tensor(st_data_all[i4data_all]['data_x_1d'])

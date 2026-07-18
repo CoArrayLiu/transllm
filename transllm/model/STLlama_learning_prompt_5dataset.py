@@ -1141,6 +1141,7 @@ class STLlamaForCausalLM(LlamaForCausalLM):
             self.training_stage == "router" and labels_batch is not None
         )
         logits = self.lm_head(hidden_states) if compute_language_loss else None
+        loss_components = {}
         loss = None
         if labels_batch is not None:
 
@@ -1171,6 +1172,7 @@ class STLlamaForCausalLM(LlamaForCausalLM):
                     )
             else:
                 language_loss = hidden_states.new_zeros((), dtype=torch.float32)
+            loss_components["language_loss"] = language_loss.detach().float()
             if dataset =='SD' or dataset == 'SZ' or dataset == 'pems08' or dataset == 'urbanev':
                 if isinstance(st_data_y, (list, tuple)):
                     st_data_y = torch.cat(list(st_data_y), dim=0)
@@ -1194,15 +1196,34 @@ class STLlamaForCausalLM(LlamaForCausalLM):
                     regress_result_list.append(st_pre_final[i:i + 1, ...])
                 regress_result = torch.cat(regress_result_list, dim=0)
 
-                loss_regress = rec_loss(regress_result, labels_stpre)
-                loss_per_sample = torch.mean(torch.abs(regress_result - labels_stpre), dim=(1, 2, 3))
-                if dataset == 'SZ' or dataset == 'urbanev' :
-                    loss_regress_scaling_factor = 1.0
-                    loss_regress = loss_regress*loss_regress_scaling_factor
+                # Keep the raw MAE for interpretable logging, but optimize a
+                # dimensionless MAE so datasets with larger traffic units do
+                # not dominate the shared model gradients.
+                raw_loss_regress = rec_loss(
+                    regress_result.float(), labels_stpre.float()
+                )
+                loss_per_sample = torch.mean(
+                    torch.abs(regress_result.float() - labels_stpre.float()),
+                    dim=(1, 2, 3),
+                )
+                regression_scale = torch.as_tensor(
+                    batch_std,
+                    device=raw_loss_regress.device,
+                    dtype=torch.float32,
+                ).reshape(-1)
+                if regression_scale.numel() != 1:
+                    raise ValueError(
+                        f"Expected one std value for {dataset}, got "
+                        f"{regression_scale.numel()}"
+                    )
+                regression_scale = regression_scale[0].abs().clamp_min(1e-6)
+                loss_regress = raw_loss_regress / regression_scale
                 if not torch.isfinite(loss_regress):
                     raise FloatingPointError(
                         f"Non-finite regression loss for {dataset}: {loss_regress.item()}"
                     )
+                loss_components["regression_loss"] = raw_loss_regress.detach()
+                loss_components["normalized_regression_loss"] = loss_regress.detach()
                 loss = language_loss + loss_regress
             elif dataset == 'SH':
                 # ==== RL：dispatch reward ====
@@ -1269,13 +1290,16 @@ class STLlamaForCausalLM(LlamaForCausalLM):
             print(loss.shape)
             return (loss,) + output if loss is not None else output
 
-        return CausalLMOutputWithPast(
+        model_output = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions
         )
+        for name, value in loss_components.items():
+            model_output[name] = value
+        return model_output
 
     def prepare_inputs_for_generation(
             self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs

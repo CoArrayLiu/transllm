@@ -47,6 +47,19 @@ cp  backup/config.json  checkpoints/llama3-8b/config.json
 
 ### commit fix some checkpoints eval bugs
 
+检测到<ST-START>后继续输出12个<ST-PATCH>后就直接停止，加速预测
+
+修复评估：允许缺少 <ST_start> 时提取第一段连续 12 个 patch
+
+stage1评估不再使用固定prompt
+
+训练过程对各数据集回归 loss 做尺度归一化，并单独记录 language_loss、regression_loss。
+
+增加四数据集统一快速评测脚本
+
+### commit improve train and eval detailss
+
+
 
 Q:
 

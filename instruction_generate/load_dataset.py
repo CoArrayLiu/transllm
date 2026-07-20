@@ -719,6 +719,7 @@ def load_st_dataset(dataset, args):
         data_taxi_path = os.path.join('./data/st_data/pems04/pems04_clip.npz')
         data_taxi = np.load(data_taxi_path)['data']
         data_taxi = np.transpose(data_taxi, (1, 0, 2))
+        data_taxi = data_taxi[..., :1]
         data_taxi = np.concatenate([data_taxi, data_taxi], axis=-1)
         month_start = 1
         week_start = 1 

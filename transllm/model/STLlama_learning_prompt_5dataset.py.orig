@@ -1266,10 +1266,11 @@ class STLlamaForCausalLM(LlamaForCausalLM):
                 loss1 = 0.5 -reward_sum.mean() - 0.008 * entropy
                 loss_per_sample = -reward_per_grid.mean(dim=1)
                 loss = language_loss + loss1*100 + wasserstein_distance.mean() *0.05
-                reward_slot = -loss_per_sample.detach()
                 print(f"Reward mean: {reward_per_grid.mean().item():.4f}, Reward std: {reward_per_grid.std().item():.4f}, Advantage std: {advantage.std().item():.4f}, Reinforce Loss: {loss1.item():.6f}, Wasserstein: {wasserstein_distance.mean().item():.6f}", flush=True)
             else:
                 raise ValueError(f"Unsupported dataset for loss calculation: {dataset}")
+
+            reward_slot = -loss_per_sample.detach() 
 
             rewards_per_slot = [reward_slot.clone() for _ in range(self.prompt_router_sd.num_slots)]
 
@@ -1284,10 +1285,6 @@ class STLlamaForCausalLM(LlamaForCausalLM):
                 router_loss = router.finish_episode()
                 if router_loss is not None:
                     loss = loss + router_loss
-                    loss_components["router_loss"] = router_loss.detach().float()
-                    loss_components["router_reward_mean"] = (
-                        reward_slot.mean().detach().float()
-                    )
 
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite total loss for {dataset}: {loss.item()}")

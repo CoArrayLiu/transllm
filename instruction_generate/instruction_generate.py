@@ -52,7 +52,7 @@ else:
         args.json_path = args.dataset_name + '.json'
         args.pkl_path = args.dataset_name + '_pkl.pkl'
 
-if args.for_test:
+if args.for_test or args.for_zeroshot:
     args.shuffle = False
 else:
     args.shuffle = True

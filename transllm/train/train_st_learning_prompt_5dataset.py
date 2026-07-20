@@ -191,7 +191,7 @@ def read_node_information4(args):
     final_features = np.hstack([scaled_features])
     return final_features
 
-def load_adj(args):
+def load_adj(args, additional_datasets=()):
     """Load graph inputs for the four forecasting datasets only.
 
     The ST-Encoder task ids are part of the author's pretrained checkpoint and
@@ -233,7 +233,13 @@ def load_adj(args):
         ),
         "pems08": graph(args.dataset5, 6),
     }
-    assert set(graphs) == {"SD", "SZ", "pems08", "urbanev"}
+    zero_shot_datasets = set(additional_datasets)
+    unsupported = zero_shot_datasets - {"pems03", "pems04"}
+    if unsupported:
+        raise ValueError(f"Unsupported additional graph datasets: {unsupported}")
+    for dataset_name in sorted(zero_shot_datasets):
+        graphs[dataset_name] = graph(dataset_name, 6)
+    assert set(graphs) == {"SD", "SZ", "pems08", "urbanev"} | zero_shot_datasets
     return graphs
 
 def load_adj_from_numpy(numpy_file):

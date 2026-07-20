@@ -125,6 +125,20 @@ def build_specs(root: Path) -> dict[str, DatasetSpec]:
             288,
             load_npz,
         ),
+        "pems03": DatasetSpec(
+            data / "pems03" / "pems03_clip.npz",
+            data / "pems03" / "pems03_adj_clip.npy",
+            data / "pems03" / "cached_dist_matrix.npy",
+            288,
+            load_npz,
+        ),
+        "pems04": DatasetSpec(
+            data / "pems04" / "pems04_clip.npz",
+            data / "pems04" / "pems04_adj_clip.npy",
+            data / "pems04" / "cached_dist_matrix.npy",
+            288,
+            load_npz,
+        ),
         "urbanev": DatasetSpec(
             data / "urbanev" / "urbanev-charge.npz",
             data / "urbanev" / "urbanev_adj.npy",
@@ -182,7 +196,7 @@ def parse_args() -> argparse.Namespace:
         "--datasets",
         nargs="+",
         default=["sd", "sz", "pems08", "urbanev"],
-        choices=["sd", "sz", "pems08", "urbanev"],
+        choices=["sd", "sz", "pems08", "pems03", "pems04", "urbanev"],
     )
     parser.add_argument("--jobs", type=int, default=8)
     parser.add_argument("--radius", type=int, default=6)

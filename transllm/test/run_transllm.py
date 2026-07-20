@@ -499,7 +499,12 @@ def eval_model(
     if graphs is None:
         args1 = get_config()
         args1.bs = 1
-        graphs = load_adj(args1)
+        prompt_datasets = {
+            item["id"].split("_")[1]
+            for item in prompt_file
+        }
+        zero_shot_datasets = prompt_datasets & {"pems03", "pems04"}
+        graphs = load_adj(args1, additional_datasets=zero_shot_datasets)
    
     use_st_start_end = getattr(model.config, "use_st_start_end", True)
     if not use_st_start_end:
@@ -594,7 +599,7 @@ def eval_model(
                 routing_info, original_sentence,
                 st_data_xh_tmp, st_data_xd_tmp, st_data_xw_tmp,
             )
-        elif dataset == "pems08":
+        elif dataset in {"pems08", "pems03", "pems04"}:
             graph = graphs[dataset]
             node_feature = None
             sp_matrix = graph["sp_matrix"].cuda()
@@ -741,6 +746,8 @@ def eval_model(
                     "SD": (model.st_pred_linear_1, model.st_pred_linear_3, model.st_pred_linear_2),
                     "SZ": (model.st_pred_linear_4, model.st_pred_linear_6, model.st_pred_linear_5),
                     "pems08": (model.st_pred_linear_7, model.st_pred_linear_9, model.st_pred_linear_8),
+                    "pems03": (model.st_pred_linear_7, model.st_pred_linear_9, model.st_pred_linear_8),
+                    "pems04": (model.st_pred_linear_7, model.st_pred_linear_9, model.st_pred_linear_8),
                     "urbanev": (model.st_pred_linear_10, model.st_pred_linear_12, model.st_pred_linear_11),
                 }
                 history_head, future_head, output_head = head_mapping[dataset]

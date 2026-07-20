@@ -18,18 +18,22 @@ DATASETS = {
     "SD": {
         "prompt": "data/prompt_data/SD_2021_test.json",
         "st_data": "data/prompt_data/SD_2021_test_pkl.pkl",
+        "node_count": 673,
     },
     "SZ": {
         "prompt": "data/prompt_data/SZ_2022_test.json",
         "st_data": "data/prompt_data/SZ_2022_test_pkl.pkl",
+        "node_count": 247,
     },
     "pems08": {
         "prompt": "data/prompt_data/pems08_test.json",
         "st_data": "data/prompt_data/pems08_test_pkl.pkl",
+        "node_count": 170,
     },
     "urbanev": {
         "prompt": "data/prompt_data/urbanev_test.json",
         "st_data": "data/prompt_data/urbanev_test_pkl.pkl",
+        "node_count": 275,
     },
 }
 
@@ -41,10 +45,33 @@ def parse_args():
             "while loading the model and graph resources only once."
         )
     )
-    parser.add_argument("--checkpoint", required=True)
+    model_group = parser.add_mutually_exclusive_group(required=True)
+    model_group.add_argument(
+        "--checkpoint",
+        help="Stage 1 adapter checkpoint reconstructed on top of --base-model",
+    )
+    model_group.add_argument(
+        "--model-name",
+        help="Complete Hugging Face model, including a Stage 2 checkpoint",
+    )
     parser.add_argument("--base-model", default="./checkpoints/llama3-8b")
     parser.add_argument("--output-root", required=True)
-    parser.add_argument("--num-samples", type=int, default=12)
+    range_group = parser.add_mutually_exclusive_group()
+    range_group.add_argument(
+        "--num-samples",
+        type=int,
+        default=None,
+        help="Use the same record count for every dataset (quick evaluation)",
+    )
+    range_group.add_argument(
+        "--num-windows",
+        type=int,
+        default=None,
+        help=(
+            "Evaluate this many complete time windows per dataset; the record "
+            "count is num-windows multiplied by that dataset's node count"
+        ),
+    )
     parser.add_argument("--start-id", type=int, default=0)
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument(
@@ -55,8 +82,12 @@ def parse_args():
     )
     parser.add_argument("--mape-threshold", type=float, default=1e-5)
     args = parser.parse_args()
-    if args.num_samples <= 0:
+    if args.num_samples is not None and args.num_samples <= 0:
         parser.error("--num-samples must be positive")
+    if args.num_windows is not None and args.num_windows <= 0:
+        parser.error("--num-windows must be positive")
+    if args.num_samples is None and args.num_windows is None:
+        args.num_samples = 12
     if args.start_id < 0:
         parser.error("--start-id must be non-negative")
     if args.max_new_tokens <= 0:
@@ -100,7 +131,8 @@ def calculate_metrics(result_file, requested_samples, mape_threshold):
         predictions.append(prediction)
         targets.append(target)
 
-    prediction = np.stack(predictions, axis=0)
+    # Match metric_calculation/result_test.py and the paper evaluation pipeline.
+    prediction = np.abs(np.stack(predictions, axis=0))
     target = np.stack(targets, axis=0)
     absolute_error = np.abs(prediction - target)
     squared_error = np.square(prediction - target)
@@ -148,9 +180,11 @@ def calculate_metrics(result_file, requested_samples, mape_threshold):
     }
 
 
-def build_eval_args(args, dataset, config, output_dir, end_id):
+def build_eval_args(
+    args, dataset, config, output_dir, end_id, requested_samples
+):
     return SimpleNamespace(
-        model_name=None,
+        model_name=args.model_name,
         checkpoint=args.checkpoint,
         base_model=args.base_model,
         fixed_prompt_index=args.fixed_prompt_index,
@@ -162,7 +196,7 @@ def build_eval_args(args, dataset, config, output_dir, end_id):
         max_new_tokens=args.max_new_tokens,
         start_id=args.start_id,
         end_id=end_id,
-        num_samples=args.num_samples,
+        num_samples=requested_samples,
         dataset=dataset,
     )
 
@@ -202,7 +236,10 @@ def main():
     if not torch.cuda.is_available():
         raise RuntimeError("Four-dataset checkpoint evaluation requires CUDA")
 
-    args.checkpoint = osp.abspath(args.checkpoint)
+    if args.checkpoint is not None:
+        args.checkpoint = osp.abspath(args.checkpoint)
+    if args.model_name is not None:
+        args.model_name = osp.abspath(args.model_name)
     args.base_model = osp.abspath(args.base_model)
     args.output_root = osp.abspath(args.output_root)
     os.makedirs(args.output_root, exist_ok=True)
@@ -219,7 +256,7 @@ def main():
     load_args = SimpleNamespace(
         checkpoint=args.checkpoint,
         base_model=args.base_model,
-        model_name=None,
+        model_name=args.model_name,
         fixed_prompt_index=args.fixed_prompt_index,
     )
     single_eval.disable_torch_init()
@@ -239,9 +276,11 @@ def main():
 
     summary = {
         "checkpoint": args.checkpoint,
+        "model_name": args.model_name,
         "base_model": args.base_model,
         "start_id": args.start_id,
         "num_samples_per_dataset": args.num_samples,
+        "num_windows_per_dataset": args.num_windows,
         "fixed_prompt_index": args.fixed_prompt_index,
         "max_new_tokens": args.max_new_tokens,
         "shared_runtime_load_seconds": round(load_seconds, 3),
@@ -255,12 +294,27 @@ def main():
                 f"{dataset}: start-id {args.start_id} is outside "
                 f"[0, {len(prompts)})"
             )
-        end_id = min(args.start_id + args.num_samples, len(prompts))
+        requested_samples = (
+            args.num_windows * config["node_count"]
+            if args.num_windows is not None
+            else args.num_samples
+        )
+        if args.num_windows is not None and args.start_id % config["node_count"]:
+            raise ValueError(
+                f"{dataset}: start-id {args.start_id} is not aligned to its "
+                f"{config['node_count']} records per complete time window"
+            )
+        end_id = min(args.start_id + requested_samples, len(prompts))
+        if end_id - args.start_id != requested_samples:
+            raise ValueError(
+                f"{dataset}: requested {requested_samples} records but only "
+                f"{end_id - args.start_id} are available"
+            )
         selected_prompts = prompts[args.start_id:end_id]
         output_dir = osp.join(args.output_root, dataset)
         os.makedirs(output_dir, exist_ok=True)
         eval_args = build_eval_args(
-            args, dataset, config, output_dir, end_id
+            args, dataset, config, output_dir, end_id, requested_samples
         )
 
         print(

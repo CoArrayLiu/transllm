@@ -59,8 +59,8 @@ Stage 1 结束后确认存在 `./checkpoints/transllm_4dataset/stage1_llm/full_m
 ~~~bash
 CUDA_VISIBLE_DEVICES=0 python -m transllm.train.train_learning_prompt_5dataset \
   --training_stage router \
-  --model_name_or_path ./checkpoints/transllm_4dataset/stage1_llm/full_model \
-  --output_dir ./checkpoints/transllm_4dataset/stage2_router \
+  --model_name_or_path ./checkpoints/transllm_4dataset/stage1_llm/full_model-70000 \
+  --output_dir ./checkpoints/transllm_4dataset/stage2_router_from_70000 \
   --num_train_epochs 1 \
   --per_device_train_batch_size 64 \
   --gradient_accumulation_steps 1 \
@@ -74,7 +74,8 @@ CUDA_VISIBLE_DEVICES=0 python -m transllm.train.train_learning_prompt_5dataset \
   --max_grad_norm 1.0 \
   --save_strategy steps \
   --save_steps 5000 \
-  --save_total_limit 2
+  --save_total_limit 100 \
+  --report_to none
 ~~~
 
 Router 参数保持 FP32，Llama 主体保持 BF16。Router 总 loss 包含冻结预测分支的任务 loss，因此不同数据集量纲差异较大；同时观察 loss 是否有限、`grad_norm`、下游验证指标及参数更新。

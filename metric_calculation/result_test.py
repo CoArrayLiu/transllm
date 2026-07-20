@@ -81,7 +81,7 @@ def test_classfication(y_true_in, y_pred_in):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--folder_path", required=True)
-    parser.add_argument("--dataset", choices=("SD", "SZ", "pems08", "urbanev"), required=True)
+    parser.add_argument("--dataset", choices=("SD", "SZ", "pems08", "pems03", "pems04", "urbanev"), required=True)
     parser.add_argument("--mode", choices=("regression", "classification"), default="regression")
     parser.add_argument("--mae_thresh", type=float, default=None)
     parser.add_argument("--mape_thresh", type=float, default=0.0)

@@ -41,7 +41,14 @@ r 35000  pems08   mae 12.15  RMSE 16.03  MAPE 35%
 r 40000  pems08   mae 11.71  RMSE 15.04  MAPE 44%
 r 40000  pems08   mae 10.55  RMSE 13.97  MAPE 38%
 r 50000 Average Horizon, MAE: 10.22, RMSE: 13.65, MAPE: 27.4503%
+r 65000 Average Horizon, MAE: 9.14, RMSE: 12.62, MAPE: 20.3016%
 r 70000 Average Horizon, MAE: 8.75, RMSE: 11.99, MAPE: 19.1478%s
+r 75000 Average Horizon, MAE: 10.18, RMSE: 13.38, MAPE: 32.6712%
+r 80000 Average Horizon, MAE: 9.69, RMSE: 13.16, MAPE: 28.5687%
+
+
+r5000  Average Horizon, MAE: 7.66, RMSE: 10.74, MAPE: 20.8067%
+r10000 Average Horizon, MAE: 7.66, RMSE: 10.73, MAPE: 20.7982%
 
 CUDA_VISIBLE_DEVICES=0 python -m transllm.test.run_transllm \
   --checkpoint ./checkpoints/transllm_4dataset/stage1_llm/checkpoint-65000 \
@@ -61,6 +68,59 @@ python -m metric_calculation.result_test \
 
 
 scripts/quick_eval_4datasets.sh \
-  ./checkpoints/transllm_4dataset/stage1_llm/checkpoint-50000 \
-  170 \
-  ./result_checkpoint/checkpoint-50000/quick_test
+  ./checkpoints/transllm_4dataset/stage1_llm/checkpoint-70000 \
+  680 \
+  ./result_checkpoint/checkpoint-70000/quick_test
+
+
+
+  CUDA_VISIBLE_DEVICES=0 python -m transllm.test.run_transllm \
+  --model-name ./checkpoints/transllm_4dataset/stage2_router_from_70000_normreward/checkpoint-5000 \
+  --prompting_file ./data/prompt_data/pems08_test.json \
+  --st_data_path ./data/prompt_data/pems08_test_pkl.pkl \
+  --output_res_path ./result_checkpoint/stage2_router_from_70000_normreward/checkpoint-5000/pems08 \
+  --start_id 0 \
+  --num-samples 340 \
+  --max_new_tokens 128 \
+  --num_gpus 1
+
+  python -m metric_calculation.result_test \
+  --folder_path ./result_checkpoint/stage2_router_from_70000_normreward/checkpoint-5000/pems08 \
+  --dataset pems08
+
+
+CUDA_VISIBLE_DEVICES=0 python -m transllm.test.run_transllm \
+  --model-name ./checkpoints/transllm_4dataset/stage2_router_from_70000_normreward/checkpoint-10000 \
+  --prompting_file ./data/prompt_data/pems08_test.json \
+  --st_data_path ./data/prompt_data/pems08_test_pkl.pkl \
+  --output_res_path ./result_checkpoint/stage2_router_from_70000_normreward/checkpoint-10000/pems08_12windows \
+  --start_id 0 \
+  --num-samples 1020 \
+  --max_new_tokens 128 \
+  --num_gpus 1
+
+
+
+python -m metric_calculation.result_test \
+  --folder_path ./result_checkpoint/stage2_router_from_70000_normreward/checkpoint-10000/pems08_12windows \
+  --dataset pems08
+
+
+  scripts/eval_stage2_4datasets_paper_size.sh \
+  ./checkpoints/transllm_4dataset/stage2_router_from_70000_normreward/checkpoint-10000 \
+  ./result_checkpoint/stage2_ckpt10000/paper_12windows
+
+
+CUDA_VISIBLE_DEVICES=0 python -m transllm.test.run_transllm \
+  --model-name ./checkpoints/transllm_4dataset/stage2_router_from_70000_normreward/checkpoint-10000 \
+  --prompting_file ./data/prompt_data/urbanev_test.json \
+  --st_data_path ./data/prompt_data/urbanev_test_pkl.pkl \
+  --output_res_path ./result_checkpoint/stage2_ckpt10000/paper_12windows/urbanev \
+  --start_id 0 \
+  --num-samples 3300 \
+  --max_new_tokens 128 \
+  --num_gpus 1
+
+python -m metric_calculation.result_test \
+  --folder_path ./result_checkpoint/stage2_ckpt10000/paper_12windows/urbanev \
+  --dataset urbanev
